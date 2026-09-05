@@ -1,0 +1,17 @@
+.env
+.env.local
+*.log
+
+__pycache__/
+*.pyc
+
+.DS_Store
+.idea/
+.vscode/
+
+node_modules/
+
+# Never put downloaded model weights in this repository
+*.safetensors
+*.pth
+*.ckpt
