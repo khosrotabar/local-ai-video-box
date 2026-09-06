@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import codecs
 import json
+import math
 import os
 import queue
 import re
 import secrets
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -39,6 +41,11 @@ IMAGE_MEDIA_TYPES = {
     "WEBP": "image/webp",
 }
 MAX_REFERENCES = 8
+ENGINE_SHOT_SECONDS = {
+    "ltx": 5.04,
+    "wan": 5.06,
+    "skyreels": 2.375,
+}
 ANALYZER_VERSION = "qwen2.5-vl-7b-instruct-v1"
 MAX_REFERENCE_ANALYSIS_CHARS = 420
 MAX_REFERENCE_GUIDANCE_CHARS = 2800
@@ -86,6 +93,7 @@ class GenerateRequest(BaseModel):
     prompt: str = Field(min_length=3, max_length=8000)
     negative_prompt: str | None = None
     seed: int = 42
+    duration_seconds: Literal[5, 10, 15, 20, 30] = 5
     references: list[GenerationReference] = Field(
         default_factory=list
     )
@@ -190,6 +198,7 @@ def init_db():
                 output_file TEXT,
                 error TEXT,
                 metadata TEXT,
+                duration_seconds INTEGER NOT NULL DEFAULT 5,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
@@ -200,6 +209,7 @@ def init_db():
             "stage": "TEXT",
             "started_at": "TEXT",
             "finished_at": "TEXT",
+            "duration_seconds": "INTEGER NOT NULL DEFAULT 5",
         }
 
         for column, sql_type in migrations.items():
@@ -402,6 +412,7 @@ def row_to_dict(row: sqlite3.Row):
         "engine": row["engine"],
         "prompt": row["prompt"],
         "seed": row["seed"],
+        "duration_seconds": row["duration_seconds"],
         "status": row["status"],
         "progress": row["progress"],
         "stage": row["stage"],
@@ -663,6 +674,7 @@ def run_live_process(
     *,
     cwd: Path | None = None,
     env=None,
+    progress_range: tuple[int, int] | None = None,
 ):
     recent_lines: deque[str] = deque(maxlen=120)
 
@@ -743,6 +755,14 @@ def run_live_process(
                         last_stage = stage
 
                     if parsed_progress is not None:
+                        if progress_range is not None:
+                            range_start, range_end = progress_range
+                            parsed_progress = int(
+                                range_start
+                                + (range_end - range_start)
+                                * (parsed_progress / 99)
+                            )
+
                         progress = max(last_progress, parsed_progress)
 
                         if progress != last_progress:
@@ -1052,11 +1072,49 @@ def build_effective_prompt(user_prompt: str, analyses: list[dict]) -> str:
     )
 
 
+def run_managed_process(
+    job_id: str,
+    command: list[str],
+    log_path: Path,
+):
+    process = None
+
+    try:
+        with log_path.open("a", encoding="utf-8", buffering=1) as log:
+            process = subprocess.Popen(
+                command,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            register_process(job_id, process)
+
+            while process.poll() is None:
+                if get_status(job_id) == "cancelled":
+                    terminate_process_tree(process)
+                    raise JobCancelled()
+
+                time.sleep(0.2)
+
+        if get_status(job_id) == "cancelled":
+            raise JobCancelled()
+
+        if process.returncode != 0:
+            raise RuntimeError("Video assembly failed.")
+
+    finally:
+        if process is not None:
+            unregister_process(job_id, process)
+
+
 def run_ltx(
     job_id: str,
     job,
     output: Path,
     log_path: Path,
+    start_image: Path | None,
+    final_target: Path | None,
+    progress_range: tuple[int, int],
 ):
     repo = ROOT / "engines" / "ltx" / "LTX-2"
     py = repo / ".venv" / "bin" / "python"
@@ -1127,9 +1185,6 @@ def run_ltx(
         str(output),
     ]
 
-    start_image = get_primary_reference_path(job_id)
-    final_target = get_final_target_path(job_id)
-
     if start_image is not None:
         if not start_image.is_file():
             raise RuntimeError("Referenced start image is unavailable.")
@@ -1163,6 +1218,7 @@ def run_ltx(
         log_path,
         cwd=repo,
         env=common_env(),
+        progress_range=progress_range,
     )
 
 
@@ -1171,6 +1227,9 @@ def run_wan(
     job,
     output: Path,
     log_path: Path,
+    start_image: Path | None,
+    final_target: Path | None,
+    progress_range: tuple[int, int],
 ):
     repo = ROOT / "engines" / "wan" / "LightX2V"
 
@@ -1227,9 +1286,6 @@ exec \
   --negative_prompt "$JOB_NEG" \
   --save_result_path "$JOB_OUT"
 """
-
-    start_image = get_primary_reference_path(job_id)
-    final_target = get_final_target_path(job_id)
 
     if start_image is not None:
         if not start_image.is_file():
@@ -1305,6 +1361,7 @@ exec \
         log_path,
         cwd=repo,
         env=env,
+        progress_range=progress_range,
     )
 
 
@@ -1313,6 +1370,9 @@ def run_skyreels(
     job,
     output: Path,
     log_path: Path,
+    start_image: Path | None,
+    final_target: Path | None,
+    progress_range: tuple[int, int],
 ):
     repo = ROOT / "engines" / "skyreels-diffusers"
     py = repo / ".venv" / "bin" / "python"
@@ -1330,9 +1390,6 @@ def run_skyreels(
         "--seed",
         str(job["seed"]),
     ]
-
-    start_image = get_primary_reference_path(job_id)
-    final_target = get_final_target_path(job_id)
 
     if start_image is not None:
         if not start_image.is_file():
@@ -1369,6 +1426,7 @@ def run_skyreels(
         log_path,
         cwd=repo,
         env=env,
+        progress_range=progress_range,
     )
 
 
@@ -1398,6 +1456,86 @@ def probe_video(path: Path):
     return json.loads(result.stdout)
 
 
+def segment_count(engine: str, duration_seconds: int) -> int:
+    return math.ceil(
+        duration_seconds / ENGINE_SHOT_SECONDS[engine]
+    )
+
+
+def extract_continuation_frame(
+    job_id: str,
+    segment: Path,
+    frame: Path,
+    log_path: Path,
+):
+    run_managed_process(
+        job_id,
+        [
+            "ffmpeg",
+            "-y",
+            "-sseof",
+            "-0.1",
+            "-i",
+            str(segment),
+            "-frames:v",
+            "1",
+            str(frame),
+        ],
+        log_path,
+    )
+
+    if not frame.is_file() or frame.stat().st_size == 0:
+        raise RuntimeError("Unable to extract continuation frame.")
+
+
+def assemble_segments(
+    job_id: str,
+    segments: list[Path],
+    output: Path,
+    duration_seconds: int,
+    job_temp: Path,
+    log_path: Path,
+):
+    concat_list = job_temp / "segments.txt"
+    concat_list.write_text(
+        "".join(
+            f"file '{segment.as_posix()}'\n"
+            for segment in segments
+        ),
+        encoding="utf-8",
+    )
+
+    run_managed_process(
+        job_id,
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(concat_list),
+            "-t",
+            str(duration_seconds),
+            "-an",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(output),
+        ],
+        log_path,
+    )
+
+
+def cleanup_job_temp(job_temp: Path):
+    if job_temp.exists():
+        shutil.rmtree(job_temp, ignore_errors=True)
+
+
 def process_job(job_id: str):
     row = get_job(job_id)
 
@@ -1412,6 +1550,7 @@ def process_job(job_id: str):
 
     output = OUTPUT_DIR / f"{job_id}.mp4"
     log_path = LOG_DIR / f"{job_id}.log"
+    job_temp = TEMP / job_id
 
     try:
         update_job(
@@ -1427,6 +1566,9 @@ def process_job(job_id: str):
         if output.exists():
             output.unlink()
 
+        cleanup_job_temp(job_temp)
+        job_temp.mkdir(parents=True, exist_ok=True)
+
         reference_guidance = analyze_job_references(job_id, log_path)
         effective_job = dict(job)
         effective_job["prompt"] = build_effective_prompt(
@@ -1434,34 +1576,90 @@ def process_job(job_id: str):
             reference_guidance,
         )
 
-        if job["engine"] == "ltx":
-            run_ltx(
-                job_id,
-                effective_job,
-                output,
-                log_path,
-            )
-
-        elif job["engine"] == "wan":
-            run_wan(
-                job_id,
-                effective_job,
-                output,
-                log_path,
-            )
-
-        elif job["engine"] == "skyreels":
-            run_skyreels(
-                job_id,
-                effective_job,
-                output,
-                log_path,
-            )
-
-        else:
+        if job["engine"] not in ENGINE_SHOT_SECONDS:
             raise RuntimeError(
                 f"Unknown engine: {job['engine']}"
             )
+
+        native_shot_seconds = ENGINE_SHOT_SECONDS[job["engine"]]
+        total_segments = segment_count(
+            job["engine"],
+            job["duration_seconds"],
+        )
+        start_image = get_primary_reference_path(job_id)
+        final_target = get_final_target_path(job_id)
+        segments = []
+
+        for segment_index in range(total_segments):
+            segment = job_temp / f"segment-{segment_index:02d}.mp4"
+            segments.append(segment)
+            is_last_segment = segment_index == total_segments - 1
+            progress_start = 5 + (89 * segment_index // total_segments)
+            progress_end = 5 + (89 * (segment_index + 1) // total_segments)
+
+            segment_job = dict(effective_job)
+
+            if segment_index:
+                segment_job["prompt"] += (
+                    "\n\nContinue naturally from the provided starting "
+                    "frame while preserving scene, subjects, style, lighting, "
+                    "and motion continuity."
+                )
+
+            update_job(job_id, progress=progress_start)
+
+            if job["engine"] == "ltx":
+                run_ltx(
+                    job_id,
+                    segment_job,
+                    segment,
+                    log_path,
+                    start_image,
+                    final_target if is_last_segment else None,
+                    (progress_start, progress_end),
+                )
+            elif job["engine"] == "wan":
+                run_wan(
+                    job_id,
+                    segment_job,
+                    segment,
+                    log_path,
+                    start_image,
+                    final_target if is_last_segment else None,
+                    (progress_start, progress_end),
+                )
+            else:
+                run_skyreels(
+                    job_id,
+                    segment_job,
+                    segment,
+                    log_path,
+                    start_image,
+                    final_target if is_last_segment else None,
+                    (progress_start, progress_end),
+                )
+
+            if get_status(job_id) == "cancelled":
+                raise JobCancelled()
+
+            if not segment.is_file() or segment.stat().st_size == 0:
+                raise RuntimeError(
+                    "Engine finished but no video was produced."
+                )
+
+            update_job(job_id, progress=progress_end)
+
+            if not is_last_segment:
+                continuation_frame = (
+                    job_temp / f"continuation-{segment_index:02d}.png"
+                )
+                extract_continuation_frame(
+                    job_id,
+                    segment,
+                    continuation_frame,
+                    log_path,
+                )
+                start_image = continuation_frame
 
         if get_status(job_id) == "cancelled":
             raise JobCancelled()
@@ -1469,18 +1667,29 @@ def process_job(job_id: str):
         update_job(
             job_id,
             stage="encoding_video",
-            progress=99,
+            progress=96,
         )
 
-        if (
-            not output.exists()
-            or output.stat().st_size == 0
-        ):
-            raise RuntimeError(
-                "Engine finished but no video was produced."
-            )
+        assemble_segments(
+            job_id,
+            segments,
+            output,
+            job["duration_seconds"],
+            job_temp,
+            log_path,
+        )
+
+        if not output.is_file() or output.stat().st_size == 0:
+            raise RuntimeError("Video assembly produced no output.")
 
         metadata = probe_video(output)
+        actual_duration_seconds = float(
+            metadata.get("format", {}).get("duration", 0)
+        )
+        metadata["requested_duration_seconds"] = job["duration_seconds"]
+        metadata["actual_duration_seconds"] = actual_duration_seconds
+        metadata["segment_count"] = total_segments
+        metadata["native_shot_seconds"] = native_shot_seconds
         metadata["references"] = get_job_references(job_id)
         metadata["reference_guidance"] = reference_guidance
         metadata["reference_analyzer"] = (
@@ -1551,6 +1760,9 @@ def process_job(job_id: str):
             finished_at=now(),
         )
 
+    finally:
+        cleanup_job_temp(job_temp)
+
 
 def worker_loop():
     while True:
@@ -1601,7 +1813,7 @@ def engines():
                 "resolution": "1536x1024",
                 "fps": 24,
                 "frames": 121,
-                "shot_seconds": 5.04,
+                "shot_seconds": ENGINE_SHOT_SECONDS["ltx"],
                 "direct_long": False,
                 "supports_start_image": True,
                 "supports_final_target": True,
@@ -1614,7 +1826,7 @@ def engines():
                 "resolution": "832x480",
                 "fps": 16,
                 "frames": 81,
-                "shot_seconds": 5.06,
+                "shot_seconds": ENGINE_SHOT_SECONDS["wan"],
                 "direct_long": False,
                 "supports_start_image": True,
                 "supports_final_target": True,
@@ -1627,7 +1839,7 @@ def engines():
                 "resolution": "960x544",
                 "fps": 24,
                 "frames": 57,
-                "shot_seconds": 2.375,
+                "shot_seconds": ENGINE_SHOT_SECONDS["skyreels"],
                 "direct_long": False,
                 "supports_start_image": True,
                 "supports_final_target": True,
@@ -1828,6 +2040,7 @@ def create_generation(request: GenerateRequest):
                 prompt,
                 negative_prompt,
                 seed,
+                duration_seconds,
                 status,
                 progress,
                 stage,
@@ -1835,7 +2048,7 @@ def create_generation(request: GenerateRequest):
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job_id,
@@ -1843,6 +2056,7 @@ def create_generation(request: GenerateRequest):
                 request.prompt,
                 request.negative_prompt,
                 request.seed,
+                request.duration_seconds,
                 "queued",
                 0,
                 "queued",
@@ -1873,6 +2087,7 @@ def create_generation(request: GenerateRequest):
     return {
         "id": job_id,
         "engine": request.engine,
+        "duration_seconds": request.duration_seconds,
         "status": "queued",
         "progress": 0,
         "stage": "queued",

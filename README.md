@@ -59,6 +59,7 @@ curl -fsS http://127.0.0.1:11434/api/generations \
   -H "Content-Type: application/json" \
   --data "{
     \"engine\": \"ltx\",
+    \"duration_seconds\": 10,
     \"prompt\": \"A cinematic slow camera move through a moonlit forest.\",
     \"references\": [
       {\"upload_id\": \"$START_UPLOAD_ID\", \"role\": \"start_image\"},
@@ -71,6 +72,11 @@ curl -fsS http://127.0.0.1:11434/api/generations \
 roles are `reference` (the default when omitted), `start_image`, `character`,
 `object`, `style`, `location`, and `final_target`. A generation accepts at
 most one `final_target`.
+
+`duration_seconds` is optional and accepts `5`, `10`, `15`, `20`, or `30`
+(default: `5`). The API assembles sequential native shots into one trimmed
+H.264 MP4, using each completed shot's final frame as the next shot's start
+image.
 
 All references are persisted and returned with generation records. The first
 `start_image`, or else the first submitted reference, remains the native I2V
