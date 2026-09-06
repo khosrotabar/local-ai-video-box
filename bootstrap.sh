@@ -19,7 +19,6 @@ umask 077
 #   - LTX start-image conditioning
 #
 # Not included yet:
-#   - SkyReels image input
 #   - Wan image input
 #   - long movie orchestration
 # ============================================================
@@ -676,6 +675,7 @@ import torchvision
 
 from diffusers import (
     AutoencoderKLWan,
+    SkyReelsV2DiffusionForcingImageToVideoPipeline,
     SkyReelsV2DiffusionForcingPipeline,
 )
 
@@ -688,6 +688,7 @@ print("Torchvision:", torchvision.__version__)
 print("CUDA:", torch.version.cuda)
 print("GPU:", torch.cuda.get_device_name(0))
 print("SkyReels Diffusers import: OK")
+print("SkyReels I2V Diffusers import: OK")
 print("TorchAO import: OK")
 print("SkyReels environment READY ✅")
 PY
@@ -1140,7 +1141,7 @@ echo "  Cancellation            ✅"
 echo "  GPU process cleanup     ✅"
 echo "  Upload API              ✅"
 echo "  LTX start-image input   ✅"
-echo "  SkyReels image input    ❌ not implemented yet"
+echo "  SkyReels image input    ✅"
 echo "  Wan image input         ❌ not implemented yet"
 echo "  Long movie orchestrator ❌ not implemented yet"
 

@@ -822,6 +822,19 @@ def run_skyreels(
         str(job["seed"]),
     ]
 
+    start_image = get_start_image_path(job_id)
+
+    if start_image is not None:
+        if not start_image.is_file():
+            raise RuntimeError("Referenced start image is unavailable.")
+
+        command.extend(
+            [
+                "--image",
+                str(start_image),
+            ]
+        )
+
     env = common_env()
 
     env["PYTORCH_CUDA_ALLOC_CONF"] = (
@@ -1068,7 +1081,7 @@ def engines():
                 "frames": 57,
                 "shot_seconds": 2.375,
                 "direct_long": False,
-                "supports_start_image": False,
+                "supports_start_image": True,
             },
         ]
     }
@@ -1193,10 +1206,16 @@ def create_generation(request: GenerateRequest):
             detail="At most one start_image reference is supported.",
         )
 
-    if request.references and request.engine != "ltx":
+    if request.references and request.engine not in (
+        "ltx",
+        "skyreels",
+    ):
         raise HTTPException(
             status_code=422,
-            detail="start_image references are currently supported only by LTX.",
+            detail=(
+                "start_image references are currently supported only by "
+                "LTX and SkyReels."
+            ),
         )
 
     reference_ids = [

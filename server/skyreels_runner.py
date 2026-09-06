@@ -3,9 +3,11 @@ import os
 import time
 
 import torch
+from PIL import Image
 
 from diffusers import (
     AutoencoderKLWan,
+    SkyReelsV2DiffusionForcingImageToVideoPipeline,
     SkyReelsV2DiffusionForcingPipeline,
     SkyReelsV2Transformer3DModel,
     UniPCMultistepScheduler,
@@ -26,6 +28,7 @@ def main():
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--image")
     args = parser.parse_args()
 
     os.environ.setdefault(
@@ -66,17 +69,33 @@ def main():
         torch_dtype=torch.float32,
     )
 
-    pipe = SkyReelsV2DiffusionForcingPipeline.from_pretrained(
-        MODEL_ID,
-        transformer=transformer,
-        vae=vae,
-        torch_dtype=torch.bfloat16,
-    )
+    if args.image:
+        pipe = (
+            SkyReelsV2DiffusionForcingImageToVideoPipeline
+            .from_pretrained(
+                MODEL_ID,
+                transformer=transformer,
+                vae=vae,
+                torch_dtype=torch.bfloat16,
+            )
+        )
 
-    pipe.scheduler = UniPCMultistepScheduler.from_config(
-        pipe.scheduler.config,
-        flow_shift=8.0,
-    )
+        pipe.scheduler = UniPCMultistepScheduler.from_config(
+            pipe.scheduler.config,
+            flow_shift=5.0,
+        )
+    else:
+        pipe = SkyReelsV2DiffusionForcingPipeline.from_pretrained(
+            MODEL_ID,
+            transformer=transformer,
+            vae=vae,
+            torch_dtype=torch.bfloat16,
+        )
+
+        pipe.scheduler = UniPCMultistepScheduler.from_config(
+            pipe.scheduler.config,
+            flow_shift=8.0,
+        )
 
     print("[4/6] Enabling aggressive group offload...")
 
@@ -112,19 +131,39 @@ def main():
 
     generator = torch.Generator(device="cuda").manual_seed(args.seed)
 
-    result = pipe(
-        prompt=args.prompt,
-        height=544,
-        width=960,
-        num_frames=57,
-        base_num_frames=57,
-        num_inference_steps=20,
-        ar_step=5,
-        causal_block_size=5,
-        overlap_history=None,
-        addnoise_condition=20,
-        generator=generator,
-    )
+    if args.image:
+        with Image.open(args.image) as source_image:
+            start_image = source_image.convert("RGB")
+
+        result = pipe(
+            image=start_image,
+            prompt=args.prompt,
+            height=544,
+            width=960,
+            num_frames=57,
+            base_num_frames=57,
+            num_inference_steps=20,
+            guidance_scale=5.0,
+            ar_step=5,
+            causal_block_size=5,
+            overlap_history=None,
+            addnoise_condition=20,
+            generator=generator,
+        )
+    else:
+        result = pipe(
+            prompt=args.prompt,
+            height=544,
+            width=960,
+            num_frames=57,
+            base_num_frames=57,
+            num_inference_steps=20,
+            ar_step=5,
+            causal_block_size=5,
+            overlap_history=None,
+            addnoise_condition=20,
+            generator=generator,
+        )
 
     print("[6/6] Encoding MP4...")
 
