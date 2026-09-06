@@ -829,9 +829,6 @@ snapshot_download(
     token=os.environ["HF_TOKEN"],
     local_dir="$WAN_I2V_BASE",
     allow_patterns=[
-        "Wan2.1_VAE.pth",
-        "models_t5_umt5-xxl-enc-bf16.pth",
-        "google/*",
         "low_noise_model/config.json",
     ],
 )
@@ -906,6 +903,9 @@ test -f \
 test -f \
 "$WAN_BASE/models_t5_umt5-xxl-enc-bf16.pth"
 
+test -d \
+"$WAN_BASE/google/umt5-xxl"
+
 test -f \
 "$WAN_BASE/low_noise_model/config.json"
 
@@ -914,18 +914,6 @@ test -f \
 
 test -f \
 "$WAN_QUANT/Wan2.2-T2V-A14B_NVFP4_Sparse_low.safetensors"
-
-test -f \
-"$WAN_I2V_BASE/Wan2.1_VAE.pth"
-
-test -f \
-"$WAN_I2V_BASE/models_t5_umt5-xxl-enc-bf16.pth"
-
-test -f \
-"$WAN_I2V_BASE/google/umt5-xxl/tokenizer.json"
-
-test -f \
-"$WAN_I2V_BASE/google/umt5-xxl/spiece.model"
 
 test -f \
 "$WAN_I2V_BASE/low_noise_model/config.json"
