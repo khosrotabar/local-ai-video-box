@@ -77,6 +77,7 @@ class GenerationReference(BaseModel):
         "object",
         "style",
         "location",
+        "final_target",
     ] = "reference"
 
 
@@ -315,12 +316,33 @@ def get_primary_reference_path(job_id: str) -> Path | None:
             FROM job_references
             JOIN uploads ON uploads.id = job_references.upload_id
             WHERE job_references.job_id=?
+              AND job_references.role != 'final_target'
             ORDER BY
                 CASE job_references.role
                     WHEN 'start_image' THEN 0
                     ELSE 1
                 END,
                 job_references.position
+            LIMIT 1
+            """,
+            (job_id,),
+        ).fetchone()
+
+    if row is None:
+        return None
+
+    return UPLOAD_DIR / row["stored_file"]
+
+
+def get_final_target_path(job_id: str) -> Path | None:
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT uploads.stored_file
+            FROM job_references
+            JOIN uploads ON uploads.id = job_references.upload_id
+            WHERE job_references.job_id=?
+              AND job_references.role='final_target'
             LIMIT 1
             """,
             (job_id,),
@@ -979,9 +1001,18 @@ def build_effective_prompt(user_prompt: str, analyses: list[dict]) -> str:
     if not analyses:
         return user_prompt
 
+    final_target_constraint = (
+        "The final frame must match the uploaded target image exactly. "
+        "Do not substitute, redesign, reinterpret, or replace its symbol. "
+    )
     label_characters = sum(
         len(item["role"]) + 2
         for item in analyses
+    )
+    constraint_characters = sum(
+        len(final_target_constraint)
+        for item in analyses
+        if item["role"] == "final_target"
     )
     analysis_budget = max(
         1,
@@ -989,14 +1020,24 @@ def build_effective_prompt(user_prompt: str, analyses: list[dict]) -> str:
             MAX_REFERENCE_GUIDANCE_CHARS
             - label_characters
             - len(analyses)
+            - constraint_characters
         ) // len(analyses),
     )
     guidance_lines = []
 
     for item in analyses:
+        if item["role"] == "final_target":
+            analysis = (
+                final_target_constraint
+                +
+                f"{item['analysis'][:analysis_budget]}"
+            )
+        else:
+            analysis = item["analysis"][:analysis_budget]
+
         guidance_lines.append(
             f"{item['role'].upper()}: "
-            f"{item['analysis'][:analysis_budget]}"
+            f"{analysis}"
         )
 
     guidance = "\n".join(guidance_lines)
@@ -1097,6 +1138,21 @@ def run_ltx(
                 "--image",
                 str(start_image),
                 "0",
+                "1.0",
+            ]
+        )
+
+    final_target = get_final_target_path(job_id)
+
+    if final_target is not None:
+        if not final_target.is_file():
+            raise RuntimeError("Referenced final target image is unavailable.")
+
+        command.extend(
+            [
+                "--image",
+                str(final_target),
+                "120",
                 "1.0",
             ]
         )
@@ -1385,6 +1441,13 @@ def process_job(job_id: str):
             if reference_guidance
             else None
         )
+        metadata["native_final_target"] = (
+            job["engine"] == "ltx"
+            and any(
+                reference["role"] == "final_target"
+                for reference in get_job_references(job_id)
+            )
+        )
 
         update_job(
             job_id,
@@ -1494,6 +1557,7 @@ def engines():
                 "shot_seconds": 5.04,
                 "direct_long": False,
                 "supports_start_image": True,
+                "supports_final_target": True,
                 "supports_references": True,
                 "max_references": MAX_REFERENCES,
             },
@@ -1506,6 +1570,7 @@ def engines():
                 "shot_seconds": 5.06,
                 "direct_long": False,
                 "supports_start_image": True,
+                "supports_final_target": False,
                 "supports_references": True,
                 "max_references": MAX_REFERENCES,
             },
@@ -1518,6 +1583,7 @@ def engines():
                 "shot_seconds": 2.375,
                 "direct_long": False,
                 "supports_start_image": True,
+                "supports_final_target": False,
                 "supports_references": True,
                 "max_references": MAX_REFERENCES,
             },
@@ -1653,6 +1719,23 @@ def create_generation(request: GenerateRequest):
         raise HTTPException(
             status_code=422,
             detail="Duplicate upload references are not supported.",
+        )
+
+    final_target_count = sum(
+        reference.role == "final_target"
+        for reference in request.references
+    )
+
+    if final_target_count > 1:
+        raise HTTPException(
+            status_code=422,
+            detail="At most one final_target reference is supported.",
+        )
+
+    if final_target_count and request.engine != "ltx":
+        raise HTTPException(
+            status_code=422,
+            detail="final_target is currently supported only by LTX.",
         )
 
     job_id = str(uuid.uuid4())

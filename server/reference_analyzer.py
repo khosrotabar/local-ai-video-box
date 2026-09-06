@@ -38,6 +38,13 @@ ROLE_INSTRUCTIONS = {
         "Give a short scene description for consistency with this primary "
         "image. Preserve only visible details."
     ),
+    "final_target": (
+        "Describe the exact visible geometry, silhouette, proportions, "
+        "colors, stroke or line structure, and spacing. Do not infer or "
+        "name brands. Do not reinterpret a symbol as a generic letter. "
+        "Describe only what is visibly present and state that this is the "
+        "exact desired final appearance."
+    ),
 }
 
 

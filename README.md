@@ -69,7 +69,8 @@ curl -fsS http://127.0.0.1:11434/api/generations \
 
 `references` is optional and accepts up to eight unique upload IDs. Valid
 roles are `reference` (the default when omitted), `start_image`, `character`,
-`object`, `style`, and `location`.
+`object`, `style`, `location`, and `final_target`. A generation accepts at
+most one `final_target`; it is currently supported only by LTX.
 
 All references are persisted and returned with generation records. The first
 `start_image`, or else the first submitted reference, remains the native I2V
@@ -81,3 +82,8 @@ unchanged in the API and database.
 Analysis is cached by upload ID, role, and analyzer version. LTX, Wan, and
 SkyReels therefore receive the same compact multi-reference guidance while
 retaining their existing single-primary-image conditioning behavior.
+
+For LTX, `final_target` additionally conditions frame 120 of the 121-frame
+output. It is never selected as a fallback start image: LTX uses the first
+`start_image`, then the first non-`final_target` reference, or no native start
+image when neither exists.
