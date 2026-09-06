@@ -19,7 +19,6 @@ umask 077
 #   - LTX start-image conditioning
 #
 # Not included yet:
-#   - Wan image input
 #   - long movie orchestration
 # ============================================================
 
@@ -49,6 +48,8 @@ SKY="$ENGINES/skyreels-diffusers"
 LTX_MODEL="$MODELS/ltx-2.5"
 WAN_BASE="$MODELS/wan2.2-t2v-base"
 WAN_QUANT="$MODELS/lightwan2.2-a14b-nvfp4"
+WAN_I2V_BASE="$MODELS/wan2.2-i2v-base"
+WAN_I2V_QUANT="$MODELS/lightwan2.2-a14b-nvfp4-i2v"
 
 HF_HOME="$CACHE/huggingface"
 
@@ -363,6 +364,9 @@ chmod 700 "$ROOT/uploads"
 
 [[ -f "$REPO_ROOT/configs/wan_moe_t2v_5090.json" ]] || \
     die "Missing configs/wan_moe_t2v_5090.json"
+
+[[ -f "$REPO_ROOT/configs/wan_moe_i2v_5090.json" ]] || \
+    die "Missing configs/wan_moe_i2v_5090.json"
 
 cp "$REPO_ROOT/server/app.py" \
    "$SERVER/app.py"
@@ -814,6 +818,46 @@ snapshot_download(
 print("WAN NVFP4 EXPERTS READY ✅")
 PY
 
+log "DOWNLOAD WAN 2.2 I2V BASE COMPONENTS"
+
+"$TOOLPY" - <<PY
+import os
+from huggingface_hub import snapshot_download
+
+snapshot_download(
+    repo_id="Wan-AI/Wan2.2-I2V-A14B",
+    token=os.environ["HF_TOKEN"],
+    local_dir="$WAN_I2V_BASE",
+    allow_patterns=[
+        "Wan2.1_VAE.pth",
+        "models_t5_umt5-xxl-enc-bf16.pth",
+        "google/*",
+        "low_noise_model/config.json",
+    ],
+)
+
+print("WAN I2V BASE COMPONENTS READY ✅")
+PY
+
+log "DOWNLOAD WAN 2.2 I2V NVFP4 EXPERTS"
+
+"$TOOLPY" - <<PY
+import os
+from huggingface_hub import snapshot_download
+
+snapshot_download(
+    repo_id="lightx2v/LightWan2.2-A14B",
+    token=os.environ["HF_TOKEN"],
+    local_dir="$WAN_I2V_QUANT",
+    allow_patterns=[
+        "Wan2.2-I2V-A14B_NVFP4_Sparse_high.safetensors",
+        "Wan2.2-I2V-A14B_NVFP4_Sparse_low.safetensors",
+    ],
+)
+
+print("WAN I2V NVFP4 EXPERTS READY ✅")
+PY
+
 log "DOWNLOAD SKYREELS V2 DF 14B"
 
 "$TOOLPY" - <<PY
@@ -871,6 +915,27 @@ test -f \
 test -f \
 "$WAN_QUANT/Wan2.2-T2V-A14B_NVFP4_Sparse_low.safetensors"
 
+test -f \
+"$WAN_I2V_BASE/Wan2.1_VAE.pth"
+
+test -f \
+"$WAN_I2V_BASE/models_t5_umt5-xxl-enc-bf16.pth"
+
+test -f \
+"$WAN_I2V_BASE/google/umt5-xxl/tokenizer.json"
+
+test -f \
+"$WAN_I2V_BASE/google/umt5-xxl/spiece.model"
+
+test -f \
+"$WAN_I2V_BASE/low_noise_model/config.json"
+
+test -f \
+"$WAN_I2V_QUANT/Wan2.2-I2V-A14B_NVFP4_Sparse_high.safetensors"
+
+test -f \
+"$WAN_I2V_QUANT/Wan2.2-I2V-A14B_NVFP4_Sparse_low.safetensors"
+
 echo "MODEL FILE CHECK READY ✅"
 
 # ============================================================
@@ -912,6 +977,43 @@ jq '{
     high_noise_quantized_ckpt,
     low_noise_quantized_ckpt
 }' "$WAN_CONFIG"
+
+log "INSTALL WAN I2V RTX 5090 CONFIG"
+
+WAN_I2V_CONFIG_DIR="$WAN/configs/wan22/extreme"
+WAN_I2V_CONFIG="$WAN_I2V_CONFIG_DIR/wan_moe_i2v_5090.json"
+
+mkdir -p "$WAN_I2V_CONFIG_DIR"
+
+cp \
+    "$REPO_ROOT/configs/wan_moe_i2v_5090.json" \
+    "$WAN_I2V_CONFIG"
+
+TMP_I2V_CONFIG="$(mktemp)"
+
+jq \
+  --arg hi "$WAN_I2V_QUANT/Wan2.2-I2V-A14B_NVFP4_Sparse_high.safetensors" \
+  --arg lo "$WAN_I2V_QUANT/Wan2.2-I2V-A14B_NVFP4_Sparse_low.safetensors" \
+  '
+    .high_noise_quantized_ckpt = $hi
+    | .low_noise_quantized_ckpt = $lo
+    | .high_noise_original_ckpt = null
+    | .low_noise_original_ckpt = null
+  ' \
+  "$WAN_I2V_CONFIG" > "$TMP_I2V_CONFIG"
+
+mv "$TMP_I2V_CONFIG" "$WAN_I2V_CONFIG"
+
+jq '{
+    infer_steps,
+    target_video_length,
+    target_height,
+    target_width,
+    use_image_encoder,
+    dit_quant_scheme,
+    high_noise_quantized_ckpt,
+    low_noise_quantized_ckpt
+}' "$WAN_I2V_CONFIG"
 
 # ============================================================
 # FINAL WAN IMPORT VERIFICATION
@@ -1142,7 +1244,7 @@ echo "  GPU process cleanup     ✅"
 echo "  Upload API              ✅"
 echo "  LTX start-image input   ✅"
 echo "  SkyReels image input    ✅"
-echo "  Wan image input         ❌ not implemented yet"
+echo "  Wan image input         ✅"
 echo "  Long movie orchestrator ❌ not implemented yet"
 
 echo

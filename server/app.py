@@ -813,6 +813,40 @@ exec \
   --save_result_path "$JOB_OUT"
 """
 
+    start_image = get_start_image_path(job_id)
+
+    if start_image is not None:
+        if not start_image.is_file():
+            raise RuntimeError("Referenced start image is unavailable.")
+
+        env["JOB_IMAGE"] = str(start_image)
+
+        script = r"""
+set -Eeuo pipefail
+
+export PYTHONPATH="${PYTHONPATH:-}"
+
+lightx2v_path=/opt/ai-movie/engines/wan/LightX2V
+model_path=/opt/ai-movie/models/wan2.2-i2v-base
+
+source \
+  /opt/ai-movie/engines/wan/LightX2V/scripts/base/base.sh
+
+exec \
+  /opt/ai-movie/engines/wan/LightX2V/.venv/bin/python \
+  -m lightx2v.infer \
+  --model_cls wan2.2_moe \
+  --task i2v \
+  --model_path \
+    /opt/ai-movie/models/wan2.2-i2v-base \
+  --config_json \
+    /opt/ai-movie/engines/wan/LightX2V/configs/wan22/extreme/wan_moe_i2v_5090.json \
+  --image_path "$JOB_IMAGE" \
+  --prompt "$JOB_PROMPT" \
+  --negative_prompt "$JOB_NEG" \
+  --save_result_path "$JOB_OUT"
+"""
+
     run_live_process(
         job_id,
         "wan",
@@ -1095,7 +1129,7 @@ def engines():
                 "frames": 81,
                 "shot_seconds": 5.06,
                 "direct_long": False,
-                "supports_start_image": False,
+                "supports_start_image": True,
             },
             {
                 "id": "skyreels",
@@ -1232,13 +1266,14 @@ def create_generation(request: GenerateRequest):
 
     if request.references and request.engine not in (
         "ltx",
+        "wan",
         "skyreels",
     ):
         raise HTTPException(
             status_code=422,
             detail=(
                 "start_image references are currently supported only by "
-                "LTX and SkyReels."
+                "LTX, Wan, and SkyReels."
             ),
         )
 
