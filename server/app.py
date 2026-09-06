@@ -324,9 +324,33 @@ STEP_RE = re.compile(
     r"(?<!\d)(\d+)\s*/\s*(\d+)(?!\d)"
 )
 
+STAGE_ORDER = {
+    "starting": 0,
+    "loading_model": 1,
+    "encoding_prompt": 2,
+    "generating": 3,
+    "encoding_video": 4,
+    "completed": 5,
+}
+
+
+def advance_stage(current_stage: str, candidate_stage: str) -> str:
+    current_order = STAGE_ORDER.get(current_stage)
+    candidate_order = STAGE_ORDER.get(candidate_stage)
+
+    if candidate_order is None:
+        return current_stage
+
+    if current_order is None or candidate_order > current_order:
+        return candidate_stage
+
+    return current_stage
+
 
 def detect_stage(line: str, current_stage: str) -> str:
     text = line.lower()
+
+    candidate_stage = current_stage
 
     if any(
         term in text
@@ -340,9 +364,9 @@ def detect_stage(line: str, current_stage: str) -> str:
             "load model",
         )
     ):
-        return "loading_model"
+        candidate_stage = "loading_model"
 
-    if any(
+    elif any(
         term in text
         for term in (
             "encoding prompt",
@@ -351,9 +375,9 @@ def detect_stage(line: str, current_stage: str) -> str:
             "tokenizing",
         )
     ):
-        return "encoding_prompt"
+        candidate_stage = "encoding_prompt"
 
-    if any(
+    elif any(
         term in text
         for term in (
             "generating",
@@ -366,9 +390,9 @@ def detect_stage(line: str, current_stage: str) -> str:
             "infer_main",
         )
     ):
-        return "generating"
+        candidate_stage = "generating"
 
-    if any(
+    elif any(
         term in text
         for term in (
             "encoding mp4",
@@ -380,9 +404,9 @@ def detect_stage(line: str, current_stage: str) -> str:
             "mux ",
         )
     ):
-        return "encoding_video"
+        candidate_stage = "encoding_video"
 
-    return current_stage
+    return advance_stage(current_stage, candidate_stage)
 
 
 def parse_progress(
@@ -524,7 +548,7 @@ def run_live_process(
     register_process(job_id, process)
 
     stage = "starting"
-    last_progress: int | None = None
+    last_progress = 0
     last_stage = stage
 
     decoder = codecs.getincrementaldecoder("utf-8")(
@@ -583,12 +607,12 @@ def run_live_process(
                         changes["stage"] = stage
                         last_stage = stage
 
-                    if (
-                        parsed_progress is not None
-                        and parsed_progress != last_progress
-                    ):
-                        changes["progress"] = parsed_progress
-                        last_progress = parsed_progress
+                    if parsed_progress is not None:
+                        progress = max(last_progress, parsed_progress)
+
+                        if progress != last_progress:
+                            changes["progress"] = progress
+                            last_progress = progress
 
                     if changes:
                         # Do not overwrite a cancellation that happened
