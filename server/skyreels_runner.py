@@ -29,7 +29,11 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--image")
+    parser.add_argument("--last-image")
     args = parser.parse_args()
+
+    if args.last_image and not args.image:
+        parser.error("--last-image requires --image")
 
     os.environ.setdefault(
         "PYTORCH_CUDA_ALLOC_CONF",
@@ -135,21 +139,32 @@ def main():
         with Image.open(args.image) as source_image:
             start_image = source_image.convert("RGB")
 
-        result = pipe(
-            image=start_image,
-            prompt=args.prompt,
-            height=544,
-            width=960,
-            num_frames=57,
-            base_num_frames=57,
-            num_inference_steps=20,
-            guidance_scale=5.0,
-            ar_step=5,
-            causal_block_size=5,
-            overlap_history=None,
-            addnoise_condition=20,
-            generator=generator,
-        )
+        final_target = None
+
+        if args.last_image:
+            with Image.open(args.last_image) as target_image:
+                final_target = target_image.convert("RGB")
+
+        image_kwargs = {
+            "image": start_image,
+            "prompt": args.prompt,
+            "height": 544,
+            "width": 960,
+            "num_frames": 57,
+            "base_num_frames": 57,
+            "num_inference_steps": 20,
+            "guidance_scale": 5.0,
+            "ar_step": 5,
+            "causal_block_size": 5,
+            "overlap_history": None,
+            "addnoise_condition": 20,
+            "generator": generator,
+        }
+
+        if final_target is not None:
+            image_kwargs["last_image"] = final_target
+
+        result = pipe(**image_kwargs)
     else:
         result = pipe(
             prompt=args.prompt,

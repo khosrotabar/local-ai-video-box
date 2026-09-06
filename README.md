@@ -70,7 +70,7 @@ curl -fsS http://127.0.0.1:11434/api/generations \
 `references` is optional and accepts up to eight unique upload IDs. Valid
 roles are `reference` (the default when omitted), `start_image`, `character`,
 `object`, `style`, `location`, and `final_target`. A generation accepts at
-most one `final_target`; it is currently supported only by LTX.
+most one `final_target`.
 
 All references are persisted and returned with generation records. The first
 `start_image`, or else the first submitted reference, remains the native I2V
@@ -84,6 +84,8 @@ SkyReels therefore receive the same compact multi-reference guidance while
 retaining their existing single-primary-image conditioning behavior.
 
 For LTX, `final_target` additionally conditions frame 120 of the 121-frame
-output. It is never selected as a fallback start image: LTX uses the first
-`start_image`, then the first non-`final_target` reference, or no native start
-image when neither exists.
+output. Wan and SkyReels use it as their native final-frame image alongside a
+non-final primary image. It is never selected as a fallback start image: the
+primary is the first `start_image`, then the first non-`final_target`
+reference. Wan and SkyReels require that primary image when a `final_target`
+is supplied.

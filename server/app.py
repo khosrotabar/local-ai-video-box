@@ -1128,6 +1128,7 @@ def run_ltx(
     ]
 
     start_image = get_primary_reference_path(job_id)
+    final_target = get_final_target_path(job_id)
 
     if start_image is not None:
         if not start_image.is_file():
@@ -1141,8 +1142,6 @@ def run_ltx(
                 "1.0",
             ]
         )
-
-    final_target = get_final_target_path(job_id)
 
     if final_target is not None:
         if not final_target.is_file():
@@ -1230,6 +1229,7 @@ exec \
 """
 
     start_image = get_primary_reference_path(job_id)
+    final_target = get_final_target_path(job_id)
 
     if start_image is not None:
         if not start_image.is_file():
@@ -1237,7 +1237,42 @@ exec \
 
         env["JOB_IMAGE"] = str(start_image)
 
-        script = r"""
+        if final_target is not None:
+            if not final_target.is_file():
+                raise RuntimeError(
+                    "Referenced final target image is unavailable."
+                )
+
+            env["JOB_FINAL_TARGET"] = str(final_target)
+
+            script = r"""
+set -Eeuo pipefail
+
+export PYTHONPATH="${PYTHONPATH:-}"
+
+lightx2v_path=/opt/ai-movie/engines/wan/LightX2V
+model_path=/opt/ai-movie/models/wan2.2-i2v-base
+
+source \
+  /opt/ai-movie/engines/wan/LightX2V/scripts/base/base.sh
+
+exec \
+  /opt/ai-movie/engines/wan/LightX2V/.venv/bin/python \
+  -m lightx2v.infer \
+  --model_cls wan2.2_moe \
+  --task flf2v \
+  --model_path \
+    /opt/ai-movie/models/wan2.2-i2v-base \
+  --config_json \
+    /opt/ai-movie/engines/wan/LightX2V/configs/wan22/extreme/wan_moe_i2v_5090.json \
+  --image_path "$JOB_IMAGE" \
+  --last_frame_path "$JOB_FINAL_TARGET" \
+  --prompt "$JOB_PROMPT" \
+  --negative_prompt "$JOB_NEG" \
+  --save_result_path "$JOB_OUT"
+"""
+        else:
+            script = r"""
 set -Eeuo pipefail
 
 export PYTHONPATH="${PYTHONPATH:-}"
@@ -1297,6 +1332,7 @@ def run_skyreels(
     ]
 
     start_image = get_primary_reference_path(job_id)
+    final_target = get_final_target_path(job_id)
 
     if start_image is not None:
         if not start_image.is_file():
@@ -1306,6 +1342,17 @@ def run_skyreels(
             [
                 "--image",
                 str(start_image),
+            ]
+        )
+
+    if final_target is not None:
+        if not final_target.is_file():
+            raise RuntimeError("Referenced final target image is unavailable.")
+
+        command.extend(
+            [
+                "--last-image",
+                str(final_target),
             ]
         )
 
@@ -1442,7 +1489,7 @@ def process_job(job_id: str):
             else None
         )
         metadata["native_final_target"] = (
-            job["engine"] == "ltx"
+            job["engine"] in ("ltx", "wan", "skyreels")
             and any(
                 reference["role"] == "final_target"
                 for reference in get_job_references(job_id)
@@ -1570,7 +1617,7 @@ def engines():
                 "shot_seconds": 5.06,
                 "direct_long": False,
                 "supports_start_image": True,
-                "supports_final_target": False,
+                "supports_final_target": True,
                 "supports_references": True,
                 "max_references": MAX_REFERENCES,
             },
@@ -1583,7 +1630,7 @@ def engines():
                 "shot_seconds": 2.375,
                 "direct_long": False,
                 "supports_start_image": True,
-                "supports_final_target": False,
+                "supports_final_target": True,
                 "supports_references": True,
                 "max_references": MAX_REFERENCES,
             },
@@ -1732,10 +1779,20 @@ def create_generation(request: GenerateRequest):
             detail="At most one final_target reference is supported.",
         )
 
-    if final_target_count and request.engine != "ltx":
+    if (
+        final_target_count
+        and request.engine in ("wan", "skyreels")
+        and not any(
+            reference.role != "final_target"
+            for reference in request.references
+        )
+    ):
         raise HTTPException(
             status_code=422,
-            detail="final_target is currently supported only by LTX.",
+            detail=(
+                "final_target requires a start_image or another non-final "
+                "reference for Wan and SkyReels."
+            ),
         )
 
     job_id = str(uuid.uuid4())
