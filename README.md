@@ -71,7 +71,13 @@ curl -fsS http://127.0.0.1:11434/api/generations \
 roles are `reference` (the default when omitted), `start_image`, `character`,
 `object`, `style`, and `location`.
 
-All references are persisted and returned with generation records. Current
-engines use one primary image internally: the first `start_image`, or else
-the first submitted reference. Additional references are stored for future
-orchestration but are not independently conditioned yet.
+All references are persisted and returned with generation records. The first
+`start_image`, or else the first submitted reference, remains the native I2V
+input. Every submitted reference is also analyzed locally by
+`Qwen/Qwen2.5-VL-7B-Instruct`; its concise role-aware guidance is added only
+to the engine's internal effective prompt. The original user prompt remains
+unchanged in the API and database.
+
+Analysis is cached by upload ID, role, and analyzer version. LTX, Wan, and
+SkyReels therefore receive the same compact multi-reference guidance while
+retaining their existing single-primary-image conditioning behavior.

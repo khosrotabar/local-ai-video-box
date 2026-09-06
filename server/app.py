@@ -39,6 +39,9 @@ IMAGE_MEDIA_TYPES = {
     "WEBP": "image/webp",
 }
 MAX_REFERENCES = 8
+ANALYZER_VERSION = "qwen2.5-vl-7b-instruct-v1"
+MAX_REFERENCE_ANALYSIS_CHARS = 420
+MAX_REFERENCE_GUIDANCE_CHARS = 2800
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -220,6 +223,20 @@ def init_db():
 
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS reference_analyses (
+                upload_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                analyzer_version TEXT NOT NULL,
+                analysis TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (upload_id, role, analyzer_version),
+                FOREIGN KEY (upload_id) REFERENCES uploads(id)
+            )
+            """
+        )
+
+        conn.execute(
+            """
             UPDATE jobs
             SET
                 status='failed',
@@ -313,6 +330,30 @@ def get_primary_reference_path(job_id: str) -> Path | None:
         return None
 
     return UPLOAD_DIR / row["stored_file"]
+
+
+def get_references_for_analysis(job_id: str):
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT job_references.upload_id, job_references.role,
+                   uploads.stored_file
+            FROM job_references
+            JOIN uploads ON uploads.id = job_references.upload_id
+            WHERE job_references.job_id=?
+            ORDER BY job_references.position
+            """,
+            (job_id,),
+        ).fetchall()
+
+    return [
+        {
+            "upload_id": row["upload_id"],
+            "role": row["role"],
+            "path": UPLOAD_DIR / row["stored_file"],
+        }
+        for row in rows
+    ]
 
 
 def update_job(job_id: str, **values):
@@ -615,8 +656,17 @@ def run_live_process(
 
     register_process(job_id, process)
 
-    stage = "starting"
-    last_progress = 0
+    current_job = get_job(job_id)
+    stage = (
+        current_job["stage"]
+        if current_job is not None and current_job["stage"]
+        else "starting"
+    )
+    last_progress = (
+        int(current_job["progress"] or 0)
+        if current_job is not None
+        else 0
+    )
     last_stage = stage
 
     decoder = codecs.getincrementaldecoder("utf-8")(
@@ -625,13 +675,8 @@ def run_live_process(
     buffer = ""
 
     try:
-        update_job(
-            job_id,
-            stage="starting",
-        )
-
         with log_path.open(
-            "w",
+            "a",
             encoding="utf-8",
             buffering=1,
         ) as log:
@@ -717,6 +762,253 @@ def run_live_process(
 
     finally:
         unregister_process(job_id, process)
+
+
+def cached_reference_analysis(upload_id: str, role: str) -> str | None:
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT analysis
+            FROM reference_analyses
+            WHERE upload_id=? AND role=? AND analyzer_version=?
+            """,
+            (upload_id, role, ANALYZER_VERSION),
+        ).fetchone()
+
+    return row["analysis"] if row is not None else None
+
+
+def clean_reference_analysis(value) -> str:
+    if not isinstance(value, str):
+        raise ValueError("Analyzer returned an invalid response.")
+
+    analysis = " ".join(value.split())
+
+    if not analysis:
+        raise ValueError("Analyzer returned an empty response.")
+
+    return analysis[:MAX_REFERENCE_ANALYSIS_CHARS]
+
+
+def run_reference_analyzer(
+    job_id: str,
+    pending_references: list[dict],
+    log_path: Path,
+) -> list[dict]:
+    analyzer = ROOT / "engines" / "reference-analyzer"
+    command_input = ROOT / "temp" / f"{job_id}-references.json"
+    command_output = ROOT / "temp" / f"{job_id}-reference-analysis.json"
+
+    payload = []
+
+    for reference in pending_references:
+        path = reference["path"]
+
+        if not path.is_file():
+            raise RuntimeError("Referenced image is unavailable.")
+
+        payload.append(
+            {
+                "upload_id": reference["upload_id"],
+                "role": reference["role"],
+                "image_path": str(path),
+            }
+        )
+
+    command_input.write_text(json.dumps(payload), encoding="utf-8")
+
+    command = [
+        str(analyzer / ".venv" / "bin" / "python"),
+        str(SERVER / "reference_analyzer.py"),
+        "--input",
+        str(command_input),
+        "--output",
+        str(command_output),
+    ]
+
+    process = None
+
+    try:
+        with log_path.open("a", encoding="utf-8", buffering=1) as log:
+            log.write("Starting local reference analysis.\n")
+            process = subprocess.Popen(
+                command,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                env=common_env(),
+            )
+            register_process(job_id, process)
+
+            while process.poll() is None:
+                if get_status(job_id) == "cancelled":
+                    terminate_process_tree(process)
+                    raise JobCancelled()
+
+                time.sleep(0.2)
+
+        if get_status(job_id) == "cancelled":
+            raise JobCancelled()
+
+        if process.returncode != 0:
+            raise RuntimeError("Reference image analysis failed.")
+
+        try:
+            results = json.loads(command_output.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Reference image analysis failed.") from exc
+
+        if not isinstance(results, list) or len(results) != len(payload):
+            raise RuntimeError("Reference image analysis failed.")
+
+        expected = {
+            (reference["upload_id"], reference["role"])
+            for reference in pending_references
+        }
+        analyses = []
+
+        for result in results:
+            if not isinstance(result, dict):
+                raise RuntimeError("Reference image analysis failed.")
+
+            upload_id = result.get("upload_id")
+            role = result.get("role")
+
+            if (upload_id, role) not in expected:
+                raise RuntimeError("Reference image analysis failed.")
+
+            analyses.append(
+                {
+                    "upload_id": upload_id,
+                    "role": role,
+                    "analysis": clean_reference_analysis(
+                        result.get("analysis")
+                    ),
+                }
+            )
+
+        if len({(item["upload_id"], item["role"]) for item in analyses}) != len(expected):
+            raise RuntimeError("Reference image analysis failed.")
+
+        with db() as conn:
+            for item in analyses:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO reference_analyses (
+                        upload_id, role, analyzer_version, analysis,
+                        created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        item["upload_id"],
+                        item["role"],
+                        ANALYZER_VERSION,
+                        item["analysis"],
+                        now(),
+                    ),
+                )
+
+        return analyses
+
+    finally:
+        if process is not None:
+            unregister_process(job_id, process)
+
+        for path in (command_input, command_output):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def analyze_job_references(job_id: str, log_path: Path) -> list[dict]:
+    references = get_references_for_analysis(job_id)
+
+    if not references:
+        return []
+
+    update_job(job_id, stage="encoding_prompt", progress=5)
+
+    analyses = []
+    pending = []
+
+    for reference in references:
+        analysis = cached_reference_analysis(
+            reference["upload_id"],
+            reference["role"],
+        )
+
+        if analysis is None:
+            pending.append(reference)
+        else:
+            analyses.append(
+                {
+                    "upload_id": reference["upload_id"],
+                    "role": reference["role"],
+                    "analysis": analysis,
+                }
+            )
+
+    if pending:
+        try:
+            generated = run_reference_analyzer(
+                job_id,
+                pending,
+                log_path,
+            )
+        except JobCancelled:
+            raise
+        except Exception as exc:
+            raise RuntimeError("Reference image analysis failed.") from exc
+
+        analyses.extend(generated)
+
+    analyses_by_key = {
+        (item["upload_id"], item["role"]): item
+        for item in analyses
+    }
+
+    return [
+        analyses_by_key[(reference["upload_id"], reference["role"])]
+        for reference in references
+    ]
+
+
+def build_effective_prompt(user_prompt: str, analyses: list[dict]) -> str:
+    if not analyses:
+        return user_prompt
+
+    label_characters = sum(
+        len(item["role"]) + 2
+        for item in analyses
+    )
+    analysis_budget = max(
+        1,
+        (
+            MAX_REFERENCE_GUIDANCE_CHARS
+            - label_characters
+            - len(analyses)
+        ) // len(analyses),
+    )
+    guidance_lines = []
+
+    for item in analyses:
+        guidance_lines.append(
+            f"{item['role'].upper()}: "
+            f"{item['analysis'][:analysis_budget]}"
+        )
+
+    guidance = "\n".join(guidance_lines)
+
+    return (
+        f"{user_prompt}\n\n"
+        "REFERENCE GUIDANCE:\n"
+        f"{guidance}\n\n"
+        "Treat reference guidance as visual constraints. Preserve "
+        "distinctive appearance where possible. Do not create a collage "
+        "or multiple panels."
+    )
 
 
 def run_ltx(
@@ -1032,10 +1324,17 @@ def process_job(job_id: str):
         if output.exists():
             output.unlink()
 
+        reference_guidance = analyze_job_references(job_id, log_path)
+        effective_job = dict(job)
+        effective_job["prompt"] = build_effective_prompt(
+            job["prompt"],
+            reference_guidance,
+        )
+
         if job["engine"] == "ltx":
             run_ltx(
                 job_id,
-                job,
+                effective_job,
                 output,
                 log_path,
             )
@@ -1043,7 +1342,7 @@ def process_job(job_id: str):
         elif job["engine"] == "wan":
             run_wan(
                 job_id,
-                job,
+                effective_job,
                 output,
                 log_path,
             )
@@ -1051,7 +1350,7 @@ def process_job(job_id: str):
         elif job["engine"] == "skyreels":
             run_skyreels(
                 job_id,
-                job,
+                effective_job,
                 output,
                 log_path,
             )
@@ -1080,6 +1379,12 @@ def process_job(job_id: str):
 
         metadata = probe_video(output)
         metadata["references"] = get_job_references(job_id)
+        metadata["reference_guidance"] = reference_guidance
+        metadata["reference_analyzer"] = (
+            "Qwen/Qwen2.5-VL-7B-Instruct"
+            if reference_guidance
+            else None
+        )
 
         update_job(
             job_id,

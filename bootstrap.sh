@@ -16,7 +16,8 @@ umask 077
 #   - real progress parsing
 #   - cancel / process-tree termination
 #   - image upload API
-#   - LTX start-image conditioning
+#   - multi-reference guidance with local Qwen vision analysis
+#   - native start-image conditioning
 #
 # Not included yet:
 #   - long movie orchestration
@@ -44,6 +45,7 @@ SPARGE="$WAN_ROOT/SpargeAttn"
 CUTLASS="$WAN_ROOT/cutlass"
 
 SKY="$ENGINES/skyreels-diffusers"
+REFERENCE_ANALYZER="$ENGINES/reference-analyzer"
 
 LTX_MODEL="$MODELS/ltx-2.5"
 WAN_BASE="$MODELS/wan2.2-t2v-base"
@@ -340,6 +342,7 @@ log "CREATE DIRECTORY STRUCTURE"
 mkdir -p \
     "$ENGINES/ltx" \
     "$WAN_ROOT" \
+    "$REFERENCE_ANALYZER" \
     "$MODELS" \
     "$OUTPUTS/api" \
     "$ROOT/uploads" \
@@ -362,6 +365,9 @@ chmod 700 "$ROOT/uploads"
 [[ -f "$REPO_ROOT/server/skyreels_runner.py" ]] || \
     die "Missing server/skyreels_runner.py"
 
+[[ -f "$REPO_ROOT/server/reference_analyzer.py" ]] || \
+    die "Missing server/reference_analyzer.py"
+
 [[ -f "$REPO_ROOT/configs/wan_moe_t2v_5090.json" ]] || \
     die "Missing configs/wan_moe_t2v_5090.json"
 
@@ -373,6 +379,9 @@ cp "$REPO_ROOT/server/app.py" \
 
 cp "$REPO_ROOT/server/skyreels_runner.py" \
    "$SERVER/skyreels_runner.py"
+
+cp "$REPO_ROOT/server/reference_analyzer.py" \
+   "$SERVER/reference_analyzer.py"
 
 # ------------------------------------------------------------
 # Clone exact engine revisions
@@ -698,6 +707,50 @@ print("SkyReels environment READY ✅")
 PY
 
 # ============================================================
+# REFERENCE ANALYZER
+# ============================================================
+
+log "INSTALL LOCAL REFERENCE ANALYZER"
+
+if [[ ! -x "$REFERENCE_ANALYZER/.venv/bin/python" ]]; then
+    uv venv \
+        --python python3.12 \
+        "$REFERENCE_ANALYZER/.venv"
+fi
+
+ANALYZERPY="$REFERENCE_ANALYZER/.venv/bin/python"
+
+# Use the CUDA 13 PyTorch family already proven on this RTX 5090.
+uv pip install \
+    --python "$ANALYZERPY" \
+    --index-url https://download.pytorch.org/whl/cu130 \
+    --index-strategy unsafe-best-match \
+    torch==2.11.0+cu130 \
+    torchvision==0.26.0+cu130
+
+# Qwen2.5-VL support is provided by Transformers with PyTorch SDPA; this
+# intentionally avoids a FlashAttention compilation dependency.
+uv pip install \
+    --python "$ANALYZERPY" \
+    transformers==4.49.0 \
+    accelerate==1.3.0 \
+    qwen-vl-utils==0.0.10 \
+    Pillow \
+    safetensors \
+    sentencepiece
+
+"$ANALYZERPY" - <<'PY'
+import torch
+from qwen_vl_utils import process_vision_info
+from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+
+assert torch.cuda.is_available()
+print("Reference analyzer Torch:", torch.__version__)
+print("Reference analyzer CUDA:", torch.version.cuda)
+print("Qwen2.5-VL imports: OK")
+PY
+
+# ============================================================
 # HUGGING FACE DOWNLOAD TOOL
 # ============================================================
 
@@ -870,6 +923,21 @@ snapshot_download(
 print("SKYREELS MODEL READY ✅")
 PY
 
+log "DOWNLOAD QWEN REFERENCE ANALYZER"
+
+# This public model does not use the Hugging Face token required by LTX.
+"$TOOLPY" - <<PY
+from huggingface_hub import snapshot_download
+
+snapshot_download(
+    repo_id="Qwen/Qwen2.5-VL-7B-Instruct",
+    cache_dir="$HF_HOME",
+    token=False,
+)
+
+print("QWEN REFERENCE ANALYZER MODEL READY ✅")
+PY
+
 # Remove token immediately after download phase.
 unset HF_TOKEN
 
@@ -923,6 +991,20 @@ test -f \
 
 test -f \
 "$WAN_I2V_QUANT/Wan2.2-I2V-A14B_NVFP4_Sparse_low.safetensors"
+
+"$TOOLPY" - <<PY
+from pathlib import Path
+from huggingface_hub import snapshot_download
+
+model_path = Path(snapshot_download(
+    repo_id="Qwen/Qwen2.5-VL-7B-Instruct",
+    cache_dir="$HF_HOME",
+    token=False,
+    local_files_only=True,
+))
+assert (model_path / "config.json").is_file()
+print("QWEN REFERENCE ANALYZER MODEL CHECK READY ✅")
+PY
 
 echo "MODEL FILE CHECK READY ✅"
 
@@ -1115,7 +1197,8 @@ log "VERIFY BACKEND CODE"
 
 "$SERVERPY" -m py_compile \
     "$SERVER/app.py" \
-    "$SERVER/skyreels_runner.py"
+    "$SERVER/skyreels_runner.py" \
+    "$SERVER/reference_analyzer.py"
 
 (
     cd "$SERVER"
@@ -1132,6 +1215,13 @@ import app
 print("FastAPI server dependencies: OK")
 PY
 )
+
+"$ANALYZERPY" - <<'PY'
+from qwen_vl_utils import process_vision_info
+from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+
+print("Reference analyzer runtime dependencies: OK")
+PY
 
 echo "Backend syntax and imports READY ✅"
 
