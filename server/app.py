@@ -38,6 +38,7 @@ IMAGE_MEDIA_TYPES = {
     "JPEG": "image/jpeg",
     "WEBP": "image/webp",
 }
+MAX_REFERENCES = 8
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -66,7 +67,14 @@ class JobCancelled(Exception):
 
 class GenerationReference(BaseModel):
     upload_id: str = Field(min_length=1, max_length=64)
-    role: Literal["start_image"]
+    role: Literal[
+        "reference",
+        "start_image",
+        "character",
+        "object",
+        "style",
+        "location",
+    ] = "reference"
 
 
 class GenerateRequest(BaseModel):
@@ -96,6 +104,71 @@ def db():
 def has_column(conn: sqlite3.Connection, name: str) -> bool:
     columns = conn.execute("PRAGMA table_info(jobs)").fetchall()
     return any(column["name"] == name for column in columns)
+
+
+def ensure_job_references_table(conn: sqlite3.Connection):
+    columns = conn.execute(
+        "PRAGMA table_info(job_references)"
+    ).fetchall()
+
+    expected_primary_key = ["job_id", "upload_id"]
+    primary_key = [
+        column["name"]
+        for column in sorted(
+            columns,
+            key=lambda column: column["pk"],
+        )
+        if column["pk"]
+    ]
+    has_position = any(
+        column["name"] == "position"
+        for column in columns
+    )
+
+    if columns and primary_key == expected_primary_key and has_position:
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_job_references_job_position
+            ON job_references (job_id, position)
+            """
+        )
+        return
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS job_references_new (
+            job_id TEXT NOT NULL,
+            upload_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            PRIMARY KEY (job_id, upload_id),
+            FOREIGN KEY (job_id) REFERENCES jobs(id),
+            FOREIGN KEY (upload_id) REFERENCES uploads(id)
+        )
+        """
+    )
+
+    if columns:
+        conn.execute(
+            """
+            INSERT INTO job_references_new (
+                job_id, upload_id, role, position
+            )
+            SELECT job_id, upload_id, role, 0
+            FROM job_references
+            """
+        )
+        conn.execute("DROP TABLE job_references")
+
+    conn.execute(
+        "ALTER TABLE job_references_new RENAME TO job_references"
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_job_references_job_position
+        ON job_references (job_id, position)
+        """
+    )
 
 
 def init_db():
@@ -143,18 +216,7 @@ def init_db():
             """
         )
 
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS job_references (
-                job_id TEXT NOT NULL,
-                upload_id TEXT NOT NULL,
-                role TEXT NOT NULL,
-                PRIMARY KEY (job_id, role),
-                FOREIGN KEY (job_id) REFERENCES jobs(id),
-                FOREIGN KEY (upload_id) REFERENCES uploads(id)
-            )
-            """
-        )
+        ensure_job_references_table(conn)
 
         conn.execute(
             """
@@ -214,7 +276,7 @@ def get_job_references(job_id: str):
             SELECT upload_id, role
             FROM job_references
             WHERE job_id=?
-            ORDER BY role
+            ORDER BY position
             """,
             (job_id,),
         ).fetchall()
@@ -228,7 +290,7 @@ def get_job_references(job_id: str):
     ]
 
 
-def get_start_image_path(job_id: str) -> Path | None:
+def get_primary_reference_path(job_id: str) -> Path | None:
     with db() as conn:
         row = conn.execute(
             """
@@ -236,7 +298,13 @@ def get_start_image_path(job_id: str) -> Path | None:
             FROM job_references
             JOIN uploads ON uploads.id = job_references.upload_id
             WHERE job_references.job_id=?
-              AND job_references.role='start_image'
+            ORDER BY
+                CASE job_references.role
+                    WHEN 'start_image' THEN 0
+                    ELSE 1
+                END,
+                job_references.position
+            LIMIT 1
             """,
             (job_id,),
         ).fetchone()
@@ -726,7 +794,7 @@ def run_ltx(
         str(output),
     ]
 
-    start_image = get_start_image_path(job_id)
+    start_image = get_primary_reference_path(job_id)
 
     if start_image is not None:
         if not start_image.is_file():
@@ -813,7 +881,7 @@ exec \
   --save_result_path "$JOB_OUT"
 """
 
-    start_image = get_start_image_path(job_id)
+    start_image = get_primary_reference_path(job_id)
 
     if start_image is not None:
         if not start_image.is_file():
@@ -880,7 +948,7 @@ def run_skyreels(
         str(job["seed"]),
     ]
 
-    start_image = get_start_image_path(job_id)
+    start_image = get_primary_reference_path(job_id)
 
     if start_image is not None:
         if not start_image.is_file():
@@ -1011,6 +1079,7 @@ def process_job(job_id: str):
             )
 
         metadata = probe_video(output)
+        metadata["references"] = get_job_references(job_id)
 
         update_job(
             job_id,
@@ -1120,6 +1189,8 @@ def engines():
                 "shot_seconds": 5.04,
                 "direct_long": False,
                 "supports_start_image": True,
+                "supports_references": True,
+                "max_references": MAX_REFERENCES,
             },
             {
                 "id": "wan",
@@ -1130,6 +1201,8 @@ def engines():
                 "shot_seconds": 5.06,
                 "direct_long": False,
                 "supports_start_image": True,
+                "supports_references": True,
+                "max_references": MAX_REFERENCES,
             },
             {
                 "id": "skyreels",
@@ -1140,6 +1213,8 @@ def engines():
                 "shot_seconds": 2.375,
                 "direct_long": False,
                 "supports_start_image": True,
+                "supports_references": True,
+                "max_references": MAX_REFERENCES,
             },
         ]
     }
@@ -1258,23 +1333,10 @@ async def upload_image(file: UploadFile = File(...)):
     dependencies=[Depends(require_auth)],
 )
 def create_generation(request: GenerateRequest):
-    if len(request.references) > 1:
+    if len(request.references) > MAX_REFERENCES:
         raise HTTPException(
             status_code=422,
-            detail="At most one start_image reference is supported.",
-        )
-
-    if request.references and request.engine not in (
-        "ltx",
-        "wan",
-        "skyreels",
-    ):
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "start_image references are currently supported only by "
-                "LTX, Wan, and SkyReels."
-            ),
+            detail=f"At most {MAX_REFERENCES} references are supported.",
         )
 
     reference_ids = [
@@ -1305,6 +1367,14 @@ def create_generation(request: GenerateRequest):
                     detail="One or more upload IDs are invalid.",
                 )
 
+        normalized_references = [
+            {
+                "upload_id": reference.upload_id,
+                "role": reference.role,
+            }
+            for reference in request.references
+        ]
+
         conn.execute(
             """
             INSERT INTO jobs (
@@ -1316,10 +1386,11 @@ def create_generation(request: GenerateRequest):
                 status,
                 progress,
                 stage,
+                metadata,
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job_id,
@@ -1330,21 +1401,25 @@ def create_generation(request: GenerateRequest):
                 "queued",
                 0,
                 "queued",
+                json.dumps({"references": normalized_references}),
                 timestamp,
                 timestamp,
             ),
         )
 
-        for reference in request.references:
+        for position, reference in enumerate(request.references):
             conn.execute(
                 """
-                INSERT INTO job_references (job_id, upload_id, role)
-                VALUES (?, ?, ?)
+                INSERT INTO job_references (
+                    job_id, upload_id, role, position
+                )
+                VALUES (?, ?, ?, ?)
                 """,
                 (
                     job_id,
                     reference.upload_id,
                     reference.role,
+                    position,
                 ),
             )
 
@@ -1356,13 +1431,7 @@ def create_generation(request: GenerateRequest):
         "status": "queued",
         "progress": 0,
         "stage": "queued",
-        "references": [
-            {
-                "upload_id": reference.upload_id,
-                "role": reference.role,
-            }
-            for reference in request.references
-        ],
+        "references": normalized_references,
     }
 
 
