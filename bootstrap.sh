@@ -15,9 +15,12 @@ umask 077
 #   - API key auth
 #   - real progress parsing
 #   - cancel / process-tree termination
+#   - image upload API
+#   - LTX start-image conditioning
 #
 # Not included yet:
-#   - image/reference upload
+#   - SkyReels image input
+#   - Wan image input
 #   - long movie orchestration
 # ============================================================
 
@@ -123,7 +126,11 @@ clone_pinned() {
 # ------------------------------------------------------------
 
 if [[ "${EUID}" -ne 0 ]]; then
-    die "Run bootstrap as root."
+    if command -v sudo >/dev/null 2>&1; then
+        exec sudo bash "$REPO_ROOT/bootstrap.sh"
+    fi
+
+    die "Root privileges are required; rerun as root."
 fi
 
 log "LOCAL AI VIDEO BOX BOOTSTRAP"
@@ -165,6 +172,10 @@ echo "OS: $PRETTY_NAME"
 
 if [[ "${ID:-}" != "ubuntu" ]]; then
     die "This bootstrap currently targets Ubuntu."
+fi
+
+if [[ "${VERSION_ID:-}" != "24.04" ]]; then
+    die "This bootstrap requires Ubuntu 24.04 for Python 3.12 and CUDA 13.0."
 fi
 
 # ------------------------------------------------------------
@@ -215,9 +226,44 @@ apt-get install -y \
     iproute2 \
     openssl \
     libgl1 \
-    libglib2.0-0
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    libsndfile1 \
+    libgomp1 \
+    libffi-dev \
+    libssl-dev \
+    libjpeg-dev \
+    libpng-dev \
+    libwebp-dev \
+    pkg-config
 
 git lfs install
+
+for required_command in \
+    git git-lfs curl wget tmux ffmpeg ffprobe jq ss openssl \
+    gcc g++ make cmake ninja python3.12 unzip pkill htop
+do
+    command -v "$required_command" >/dev/null 2>&1 || \
+        die "Required command is unavailable after package installation: $required_command"
+done
+
+# A long model/bootstrap download is easier to monitor and survives a
+# disconnected SSH client. tmux is installed above, so this never requires
+# a manual prerequisite. Re-running inside tmux continues normally.
+if [[ -z "${TMUX:-}" && -t 1 ]]; then
+    log "CONTINUE BOOTSTRAP IN TMUX"
+
+    BOOTSTRAP_COMMAND="$(
+        printf 'BOOTSTRAP_IN_TMUX=1 exec bash %q' "$REPO_ROOT/bootstrap.sh"
+    )"
+
+    exec tmux new-session \
+        -A \
+        -s bootstrap \
+        "$BOOTSTRAP_COMMAND"
+fi
 
 # ------------------------------------------------------------
 # uv
@@ -225,11 +271,25 @@ git lfs install
 
 log "INSTALL UV"
 
-if ! command -v uv >/dev/null 2>&1; then
+if [[ ! -x /usr/local/bin/uv ]] && \
+   ! command -v uv >/dev/null 2>&1 && \
+   [[ ! -x /root/.local/bin/uv ]]; then
     curl -LsSf https://astral.sh/uv/install.sh | sh
 fi
 
-export PATH="/root/.local/bin:$HOME/.local/bin:$PATH"
+export PATH="/root/.local/bin:/usr/local/bin:$PATH"
+
+UV_BIN="$(command -v uv || true)"
+
+if [[ -z "$UV_BIN" && -x /root/.local/bin/uv ]]; then
+    UV_BIN=/root/.local/bin/uv
+fi
+
+[[ -n "$UV_BIN" ]] || die "uv installation failed."
+
+if [[ "$UV_BIN" != "/usr/local/bin/uv" ]]; then
+    ln -sfn "$UV_BIN" /usr/local/bin/uv
+fi
 
 command -v uv >/dev/null 2>&1 || \
     die "uv installation failed."
@@ -654,6 +714,12 @@ uv pip install \
     --python "$TOOLPY" \
     "huggingface_hub[hf_xet]"
 
+"$TOOLPY" - <<'PY'
+import huggingface_hub
+
+print("Hugging Face downloader dependencies: OK")
+PY
+
 # ============================================================
 # ASK FOR HF TOKEN
 # ============================================================
@@ -960,13 +1026,35 @@ log "VERIFY BACKEND CODE"
     "$SERVER/app.py" \
     "$SERVER/skyreels_runner.py"
 
-echo "Backend syntax READY ✅"
+(
+    cd "$SERVER"
+
+    "$SERVERPY" - <<'PY'
+import fastapi
+import multipart
+import PIL
+import pydantic
+import uvicorn
+
+import app
+
+print("FastAPI server dependencies: OK")
+PY
+)
+
+echo "Backend syntax and imports READY ✅"
 
 # ============================================================
 # START SERVER
 # ============================================================
 
 log "START AI MOVIE API"
+
+set -a
+source "$SERVER/.env"
+set +a
+
+API_PORT="${AI_MOVIE_PORT:-11434}"
 
 tmux kill-session \
     -t ai-movie-api \
@@ -984,7 +1072,7 @@ API_READY=0
 for _ in $(seq 1 60); do
 
     if curl -fsS \
-        http://127.0.0.1:11434/api/health \
+        "http://127.0.0.1:${API_PORT}/api/health" \
         >/dev/null 2>&1
     then
         API_READY=1
@@ -1014,15 +1102,11 @@ fi
 log "VERIFY API"
 
 curl -fsS \
-    http://127.0.0.1:11434/api/health \
+    "http://127.0.0.1:${API_PORT}/api/health" \
     | jq .
 
-set -a
-source "$SERVER/.env"
-set +a
-
 curl -fsS \
-    http://127.0.0.1:11434/api/engines \
+    "http://127.0.0.1:${API_PORT}/api/engines" \
     -H "Authorization: Bearer $AI_MOVIE_API_KEY" \
     | jq .
 
@@ -1054,8 +1138,11 @@ echo "  API key auth            ✅"
 echo "  Real progress           ✅"
 echo "  Cancellation            ✅"
 echo "  GPU process cleanup     ✅"
-echo "  Reference image input   ❌ tomorrow"
-echo "  Long movie orchestrator ❌ later"
+echo "  Upload API              ✅"
+echo "  LTX start-image input   ✅"
+echo "  SkyReels image input    ❌ not implemented yet"
+echo "  Wan image input         ❌ not implemented yet"
+echo "  Long movie orchestrator ❌ not implemented yet"
 
 echo
 echo "LOCAL AI VIDEO BOX READY 🚀"
