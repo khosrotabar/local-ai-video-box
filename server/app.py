@@ -31,6 +31,7 @@ SERVER = ROOT / "server"
 OUTPUT_DIR = ROOT / "outputs" / "api"
 LOG_DIR = ROOT / "logs" / "api"
 UPLOAD_DIR = ROOT / "uploads"
+TEMP = ROOT / "temp"
 DB_PATH = SERVER / "jobs.db"
 
 MAX_UPLOAD_SIZE = 10 * 1024 * 1024
@@ -53,6 +54,7 @@ MAX_REFERENCE_GUIDANCE_CHARS = 2800
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+TEMP.mkdir(parents=True, exist_ok=True)
 
 API_KEY = os.environ.get("AI_MOVIE_API_KEY", "").strip()
 
