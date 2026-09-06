@@ -17,9 +17,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field
 
 
@@ -27,10 +28,20 @@ ROOT = Path("/opt/ai-movie")
 SERVER = ROOT / "server"
 OUTPUT_DIR = ROOT / "outputs" / "api"
 LOG_DIR = ROOT / "logs" / "api"
+UPLOAD_DIR = ROOT / "uploads"
 DB_PATH = SERVER / "jobs.db"
+
+MAX_UPLOAD_SIZE = 10 * 1024 * 1024
+UPLOAD_CHUNK_SIZE = 1024 * 1024
+IMAGE_MEDIA_TYPES = {
+    "PNG": "image/png",
+    "JPEG": "image/jpeg",
+    "WEBP": "image/webp",
+}
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 API_KEY = os.environ.get("AI_MOVIE_API_KEY", "").strip()
 
@@ -53,11 +64,19 @@ class JobCancelled(Exception):
     pass
 
 
+class GenerationReference(BaseModel):
+    upload_id: str = Field(min_length=1, max_length=64)
+    role: Literal["start_image"]
+
+
 class GenerateRequest(BaseModel):
     engine: Literal["ltx", "wan", "skyreels"] = "ltx"
     prompt: str = Field(min_length=3, max_length=8000)
     negative_prompt: str | None = None
     seed: int = 42
+    references: list[GenerationReference] = Field(
+        default_factory=list
+    )
 
 
 def now() -> str:
@@ -70,6 +89,7 @@ def db():
         timeout=30,
     )
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
@@ -110,6 +130,31 @@ def init_db():
                 conn.execute(
                     f"ALTER TABLE jobs ADD COLUMN {column} {sql_type}"
                 )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS uploads (
+                id TEXT PRIMARY KEY,
+                stored_file TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS job_references (
+                job_id TEXT NOT NULL,
+                upload_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                PRIMARY KEY (job_id, role),
+                FOREIGN KEY (job_id) REFERENCES jobs(id),
+                FOREIGN KEY (upload_id) REFERENCES uploads(id)
+            )
+            """
+        )
 
         conn.execute(
             """
@@ -162,6 +207,46 @@ def get_status(job_id: str) -> str | None:
     return row["status"] if row else None
 
 
+def get_job_references(job_id: str):
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT upload_id, role
+            FROM job_references
+            WHERE job_id=?
+            ORDER BY role
+            """,
+            (job_id,),
+        ).fetchall()
+
+    return [
+        {
+            "upload_id": row["upload_id"],
+            "role": row["role"],
+        }
+        for row in rows
+    ]
+
+
+def get_start_image_path(job_id: str) -> Path | None:
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT uploads.stored_file
+            FROM job_references
+            JOIN uploads ON uploads.id = job_references.upload_id
+            WHERE job_references.job_id=?
+              AND job_references.role='start_image'
+            """,
+            (job_id,),
+        ).fetchone()
+
+    if row is None:
+        return None
+
+    return UPLOAD_DIR / row["stored_file"]
+
+
 def update_job(job_id: str, **values):
     if not values:
         return
@@ -208,6 +293,8 @@ def row_to_dict(row: sqlite3.Row):
             result["metadata"] = None
     else:
         result["metadata"] = None
+
+    result["references"] = get_job_references(row["id"])
 
     return result
 
@@ -615,6 +702,21 @@ def run_ltx(
         str(output),
     ]
 
+    start_image = get_start_image_path(job_id)
+
+    if start_image is not None:
+        if not start_image.is_file():
+            raise RuntimeError("Referenced start image is unavailable.")
+
+        command.extend(
+            [
+                "--image",
+                str(start_image),
+                "0",
+                "1.0",
+            ]
+        )
+
     run_live_process(
         job_id,
         "ltx",
@@ -946,6 +1048,7 @@ def engines():
                 "frames": 121,
                 "shot_seconds": 5.04,
                 "direct_long": False,
+                "supports_start_image": True,
             },
             {
                 "id": "wan",
@@ -955,6 +1058,7 @@ def engines():
                 "frames": 81,
                 "shot_seconds": 5.06,
                 "direct_long": False,
+                "supports_start_image": False,
             },
             {
                 "id": "skyreels",
@@ -964,9 +1068,117 @@ def engines():
                 "frames": 57,
                 "shot_seconds": 2.375,
                 "direct_long": False,
+                "supports_start_image": False,
             },
         ]
     }
+
+
+@app.post(
+    "/api/uploads",
+    status_code=201,
+    dependencies=[Depends(require_auth)],
+)
+async def upload_image(file: UploadFile = File(...)):
+    upload_id = str(uuid.uuid4())
+    temporary_file = UPLOAD_DIR / f"{upload_id}.uploading"
+    stored_path: Path | None = None
+    size = 0
+
+    try:
+        with temporary_file.open("xb") as destination:
+            while chunk := await file.read(UPLOAD_CHUNK_SIZE):
+                size += len(chunk)
+
+                if size > MAX_UPLOAD_SIZE:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="Image upload must not exceed 10 MB.",
+                    )
+
+                destination.write(chunk)
+
+        try:
+            with Image.open(temporary_file) as image:
+                image_format = image.format
+                image.verify()
+        except (
+            Image.DecompressionBombError,
+            OSError,
+            SyntaxError,
+            UnidentifiedImageError,
+            ValueError,
+        ) as exc:
+            raise HTTPException(
+                status_code=422,
+                detail="Upload must be a valid PNG, JPEG, or WebP image.",
+            ) from exc
+
+        media_type = IMAGE_MEDIA_TYPES.get(image_format)
+
+        if media_type is None:
+            raise HTTPException(
+                status_code=422,
+                detail="Upload must be a PNG, JPEG, or WebP image.",
+            )
+
+        extension = {
+            "image/png": "png",
+            "image/jpeg": "jpg",
+            "image/webp": "webp",
+        }[media_type]
+        stored_file = f"{upload_id}.{extension}"
+        stored_path = UPLOAD_DIR / stored_file
+        os.replace(temporary_file, stored_path)
+
+        created_at = now()
+
+        with db() as conn:
+            conn.execute(
+                """
+                INSERT INTO uploads (
+                    id, stored_file, media_type, size, created_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    upload_id,
+                    stored_file,
+                    media_type,
+                    size,
+                    created_at,
+                ),
+            )
+
+        return {
+            "id": upload_id,
+            "media_type": media_type,
+            "size": size,
+            "created_at": created_at,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to store image upload.",
+        ) from exc
+    finally:
+        await file.close()
+
+        if temporary_file.exists():
+            temporary_file.unlink()
+
+        if stored_path is not None and stored_path.exists():
+            with db() as conn:
+                persisted = conn.execute(
+                    "SELECT 1 FROM uploads WHERE id=?",
+                    (upload_id,),
+                ).fetchone()
+
+            if persisted is None:
+                stored_path.unlink()
 
 
 @app.post(
@@ -975,10 +1187,46 @@ def engines():
     dependencies=[Depends(require_auth)],
 )
 def create_generation(request: GenerateRequest):
+    if len(request.references) > 1:
+        raise HTTPException(
+            status_code=422,
+            detail="At most one start_image reference is supported.",
+        )
+
+    if request.references and request.engine != "ltx":
+        raise HTTPException(
+            status_code=422,
+            detail="start_image references are currently supported only by LTX.",
+        )
+
+    reference_ids = [
+        reference.upload_id
+        for reference in request.references
+    ]
+
+    if len(set(reference_ids)) != len(reference_ids):
+        raise HTTPException(
+            status_code=422,
+            detail="Duplicate upload references are not supported.",
+        )
+
     job_id = str(uuid.uuid4())
     timestamp = now()
 
     with db() as conn:
+        if reference_ids:
+            placeholders = ", ".join("?" for _ in reference_ids)
+            uploads = conn.execute(
+                f"SELECT id FROM uploads WHERE id IN ({placeholders})",
+                reference_ids,
+            ).fetchall()
+
+            if len(uploads) != len(reference_ids):
+                raise HTTPException(
+                    status_code=422,
+                    detail="One or more upload IDs are invalid.",
+                )
+
         conn.execute(
             """
             INSERT INTO jobs (
@@ -1009,6 +1257,19 @@ def create_generation(request: GenerateRequest):
             ),
         )
 
+        for reference in request.references:
+            conn.execute(
+                """
+                INSERT INTO job_references (job_id, upload_id, role)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    job_id,
+                    reference.upload_id,
+                    reference.role,
+                ),
+            )
+
     job_queue.put(job_id)
 
     return {
@@ -1017,6 +1278,13 @@ def create_generation(request: GenerateRequest):
         "status": "queued",
         "progress": 0,
         "stage": "queued",
+        "references": [
+            {
+                "upload_id": reference.upload_id,
+                "role": reference.role,
+            }
+            for reference in request.references
+        ],
     }
 
 

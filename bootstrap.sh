@@ -282,6 +282,7 @@ mkdir -p \
     "$WAN_ROOT" \
     "$MODELS" \
     "$OUTPUTS/api" \
+    "$ROOT/uploads" \
     "$HF_HOME" \
     "$LOGS/api" \
     "$TEMP" \
@@ -289,6 +290,7 @@ mkdir -p \
     "$SERVER"
 
 chmod 700 "$SERVER"
+chmod 700 "$ROOT/uploads"
 
 # ------------------------------------------------------------
 # Validate repo payload
@@ -900,7 +902,9 @@ uv pip install \
     --python "$SERVERPY" \
     fastapi \
     "uvicorn[standard]" \
-    pydantic
+    pydantic \
+    python-multipart \
+    Pillow
 
 # ------------------------------------------------------------
 # Runtime configuration
