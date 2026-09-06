@@ -382,6 +382,7 @@ WANPY="$WAN/.venv/bin/python"
 uv pip install \
     --python "$WANPY" \
     --index-url https://download.pytorch.org/whl/cu130 \
+    --index-strategy unsafe-best-match \
     torch==2.11.0+cu130 \
     torchvision==0.26.0+cu130 \
     torchaudio==2.11.0+cu130
@@ -583,6 +584,7 @@ SKYPY="$SKY/.venv/bin/python"
 uv pip install \
     --python "$SKYPY" \
     --index-url https://download.pytorch.org/whl/cu130 \
+    --index-strategy unsafe-best-match \
     torch==2.14.0+cu130 \
     torchvision==0.29.0+cu130
 
