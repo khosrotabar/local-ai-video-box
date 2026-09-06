@@ -243,7 +243,7 @@ git lfs install
 
 for required_command in \
     git git-lfs curl wget tmux ffmpeg ffprobe jq ss openssl \
-    gcc g++ make cmake ninja python3.12 unzip pkill htop
+    gcc g++ make cmake ninja python3.12 unzip htop
 do
     command -v "$required_command" >/dev/null 2>&1 || \
         die "Required command is unavailable after package installation: $required_command"
