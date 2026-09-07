@@ -1490,6 +1490,82 @@ def extract_continuation_frame(
         raise RuntimeError("Unable to extract continuation frame.")
 
 
+def segment_has_audio(segment: Path) -> bool:
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "a",
+        "-show_entries",
+        "stream=index",
+        "-of",
+        "json",
+        str(segment),
+    ]
+
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    return bool(json.loads(result.stdout).get("streams"))
+
+
+def normalize_segment_audio(
+    job_id: str,
+    segment: Path,
+    normalized: Path,
+    has_audio: bool,
+    log_path: Path,
+):
+    if has_audio:
+        command = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(segment),
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            str(normalized),
+        ]
+    else:
+        command = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(segment),
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=channel_layout=stereo:sample_rate=48000",
+            "-shortest",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            str(normalized),
+        ]
+
+    run_managed_process(job_id, command, log_path)
+
+
 def assemble_segments(
     job_id: str,
     segments: list[Path],
@@ -1498,14 +1574,66 @@ def assemble_segments(
     job_temp: Path,
     log_path: Path,
 ):
+    audio_flags = [segment_has_audio(segment) for segment in segments]
+    has_audio = any(audio_flags)
+    all_have_audio = all(audio_flags)
+
+    if get_status(job_id) == "cancelled":
+        raise JobCancelled()
+
+    if has_audio and not all_have_audio:
+        concat_segments = []
+
+        for index, (segment, segment_has_audio_flag) in enumerate(
+            zip(segments, audio_flags)
+        ):
+            if get_status(job_id) == "cancelled":
+                raise JobCancelled()
+
+            normalized = job_temp / f"normalized-{index:02d}.mp4"
+            normalize_segment_audio(
+                job_id,
+                segment,
+                normalized,
+                segment_has_audio_flag,
+                log_path,
+            )
+            concat_segments.append(normalized)
+
+        audio_preserved = True
+    else:
+        concat_segments = segments
+        audio_preserved = all_have_audio
+
+    if get_status(job_id) == "cancelled":
+        raise JobCancelled()
+
     concat_list = job_temp / "segments.txt"
     concat_list.write_text(
         "".join(
             f"file '{segment.as_posix()}'\n"
-            for segment in segments
+            for segment in concat_segments
         ),
         encoding="utf-8",
     )
+
+    if audio_preserved:
+        audio_args = [
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+        ]
+    else:
+        audio_args = ["-an"]
 
     run_managed_process(
         job_id,
@@ -1520,7 +1648,7 @@ def assemble_segments(
             str(concat_list),
             "-t",
             str(duration_seconds),
-            "-an",
+            *audio_args,
             "-c:v",
             "libx264",
             "-pix_fmt",
@@ -1531,6 +1659,8 @@ def assemble_segments(
         ],
         log_path,
     )
+
+    return {"has_audio": has_audio, "audio_preserved": audio_preserved}
 
 
 def cleanup_job_temp(job_temp: Path):
@@ -1672,7 +1802,7 @@ def process_job(job_id: str):
             progress=96,
         )
 
-        assemble_segments(
+        audio_metadata = assemble_segments(
             job_id,
             segments,
             output,
@@ -1692,6 +1822,8 @@ def process_job(job_id: str):
         metadata["actual_duration_seconds"] = actual_duration_seconds
         metadata["segment_count"] = total_segments
         metadata["native_shot_seconds"] = native_shot_seconds
+        metadata["has_audio"] = audio_metadata["has_audio"]
+        metadata["audio_preserved"] = audio_metadata["audio_preserved"]
         metadata["references"] = get_job_references(job_id)
         metadata["reference_guidance"] = reference_guidance
         metadata["reference_analyzer"] = (
