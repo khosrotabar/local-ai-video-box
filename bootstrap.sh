@@ -183,6 +183,15 @@ fi
 
 # ------------------------------------------------------------
 # Disk
+#
+# 500GB+ free is the recommendation for comfortable headroom across the
+# full stack (LTX-2.5, Wan 2.2 T2V/I2V, SkyReels, Qwen analyzer, caches,
+# outputs/temp). A hard 350GB minimum is only enforced on a fresh
+# install with no model assets on disk yet: bootstrap must remain safe
+# to rerun on an already-provisioned server (e.g. ~250GB free with most
+# models already downloaded and only migration/reuse left to do), where
+# a blanket free-space fail would make an otherwise-idempotent rerun
+# impossible.
 # ------------------------------------------------------------
 
 mkdir -p "$ROOT"
@@ -192,8 +201,28 @@ AVAILABLE_GB=$((AVAILABLE_KB / 1024 / 1024))
 
 echo "Free disk: ${AVAILABLE_GB} GB"
 
+EXISTING_INSTALL_GB=0
+
+if [[ -d "$MODELS" || -d "$CACHE" ]]; then
+    EXISTING_INSTALL_KB="$(du -sk "$MODELS" "$CACHE" 2>/dev/null | awk '{sum += $1} END {print sum + 0}')"
+    EXISTING_INSTALL_GB=$((EXISTING_INSTALL_KB / 1024 / 1024))
+fi
+
+# 50GB is well below any single model in this stack, so this reliably
+# distinguishes "already has real model/cache data" from a fresh,
+# effectively-empty install directory.
+EXISTING_INSTALL_THRESHOLD_GB=50
+
 if (( AVAILABLE_GB < 350 )); then
-    die "At least 350GB free space is required (500GB+ recommended for normal operation and generated outputs)."
+    if (( EXISTING_INSTALL_GB >= EXISTING_INSTALL_THRESHOLD_GB )); then
+        echo "WARNING: only ${AVAILABLE_GB}GB free, below the 350GB fresh-install minimum."
+        echo "Existing installation detected (~${EXISTING_INSTALL_GB}GB already under $MODELS / $CACHE) — continuing so migration/reuse of existing models can proceed."
+        echo "500GB+ free is still recommended for normal operation and generated outputs."
+    else
+        die "At least 350GB free space is required for a fresh installation (500GB+ recommended for normal operation and generated outputs). Only ${AVAILABLE_GB}GB free was detected and no existing installation was found under $MODELS / $CACHE."
+    fi
+else
+    echo "Free disk space looks sufficient (500GB+ is still recommended for normal operation and generated outputs)."
 fi
 
 # ------------------------------------------------------------
@@ -814,13 +843,58 @@ export HF_XET_HIGH_PERFORMANCE=1
 # under $HF_HOME instead of $HF_HOME/hub. That causes a second, wasteful
 # download at runtime since huggingface_hub reads/writes $HF_HUB_CACHE.
 #
-# If a completed legacy download is found and nothing already exists at
-# the canonical destination, move it into place so it is reused instead
-# of re-downloaded. This never deletes anything and never overwrites an
-# existing hub cache entry.
+# A completed legacy download is reused by moving it into the canonical
+# hub cache. Completeness is validated via refs/snapshots/blobs, not
+# merely directory existence, so a genuinely finished ~75GB legacy
+# download is not mistaken for the kind of interrupted partial download
+# a crashed runtime process can leave behind. This never deletes model
+# data: an incomplete canonical entry that is superseded by a completed
+# legacy one is moved aside (renamed), never removed.
 # ============================================================
 
 log "CHECK FOR LEGACY HUGGING FACE CACHE LAYOUT"
+
+# Returns success if $1 is a Hugging Face hub cache entry
+# (models--Org--Name) with at least one ref pointing to a snapshot whose
+# files all resolve to real, fully-downloaded blobs (no lingering
+# blobs/*.incomplete markers, no broken symlinks).
+hf_cache_entry_is_complete() {
+    local path="$1"
+
+    [[ -d "$path/refs" && -d "$path/snapshots" && -d "$path/blobs" ]] || return 1
+
+    # huggingface_hub writes to blobs/<hash>.incomplete while a file is
+    # still downloading; any leftover marker means the entry is partial.
+    if compgen -G "$path/blobs/*.incomplete" >/dev/null; then
+        return 1
+    fi
+
+    local ref_file commit_hash snapshot_dir entry
+    for ref_file in "$path"/refs/*; do
+        [[ -f "$ref_file" ]] || continue
+
+        commit_hash="$(cat "$ref_file" 2>/dev/null || true)"
+        [[ -n "$commit_hash" ]] || continue
+
+        snapshot_dir="$path/snapshots/$commit_hash"
+        [[ -d "$snapshot_dir" ]] || continue
+        [[ -n "$(find "$snapshot_dir" -mindepth 1 -print -quit)" ]] || continue
+
+        local all_resolved=1
+        while IFS= read -r -d '' entry; do
+            if [[ ! -e "$entry" ]]; then
+                all_resolved=0
+                break
+            fi
+        done < <(find "$snapshot_dir" -type l -print0)
+
+        if [[ "$all_resolved" -eq 1 ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
 
 migrate_legacy_hf_cache_entry() {
     local model_dirname="$1"
@@ -831,17 +905,25 @@ migrate_legacy_hf_cache_entry() {
         return 0
     fi
 
-    if [[ -e "$canonical_path" ]]; then
-        echo "Canonical cache entry already exists, leaving legacy copy untouched: $legacy_path"
+    if ! hf_cache_entry_is_complete "$legacy_path"; then
+        echo "WARNING: legacy cache entry at $legacy_path does not look like a completed download (or could not be confidently verified). Leaving it untouched; $model_dirname will download normally into the canonical hub cache if needed."
         return 0
     fi
 
-    if [[ ! -d "$legacy_path/snapshots" ]]; then
-        echo "Legacy path does not look like a completed model cache, skipping: $legacy_path"
+    if [[ ! -e "$canonical_path" ]]; then
+        echo "Migrating completed legacy cache entry into canonical hub cache: $model_dirname"
+        mv "$legacy_path" "$canonical_path"
         return 0
     fi
 
-    echo "Migrating legacy cache entry into canonical hub cache: $model_dirname"
+    if hf_cache_entry_is_complete "$canonical_path"; then
+        echo "Both legacy and canonical cache entries for $model_dirname look complete. Keeping the canonical one and leaving the legacy copy untouched at $legacy_path (remove it manually once you've confirmed it is no longer needed)."
+        return 0
+    fi
+
+    local set_aside="${canonical_path}.incomplete-$(date +%s)"
+    echo "WARNING: canonical cache entry for $model_dirname is incomplete/partial while a completed legacy copy exists. Moving the incomplete canonical entry aside to $set_aside and reusing the completed legacy download instead."
+    mv "$canonical_path" "$set_aside"
     mv "$legacy_path" "$canonical_path"
 }
 
