@@ -54,6 +54,7 @@ WAN_I2V_BASE="$MODELS/wan2.2-i2v-base"
 WAN_I2V_QUANT="$MODELS/lightwan2.2-a14b-nvfp4-i2v"
 
 HF_HOME="$CACHE/huggingface"
+HF_HUB_CACHE="$HF_HOME/hub"
 
 # ------------------------------------------------------------
 # Fallback pins.
@@ -191,8 +192,8 @@ AVAILABLE_GB=$((AVAILABLE_KB / 1024 / 1024))
 
 echo "Free disk: ${AVAILABLE_GB} GB"
 
-if (( AVAILABLE_GB < 180 )); then
-    die "At least ~180GB free space is recommended."
+if (( AVAILABLE_GB < 350 )); then
+    die "At least 350GB free space is required (500GB+ recommended for normal operation and generated outputs)."
 fi
 
 # ------------------------------------------------------------
@@ -347,6 +348,7 @@ mkdir -p \
     "$OUTPUTS/api" \
     "$ROOT/uploads" \
     "$HF_HOME" \
+    "$HF_HUB_CACHE" \
     "$LOGS/api" \
     "$TEMP" \
     "$STATE" \
@@ -801,7 +803,50 @@ fi
 
 export HF_TOKEN
 export HF_HOME
+export HF_HUB_CACHE
 export HF_XET_HIGH_PERFORMANCE=1
+
+# ============================================================
+# MIGRATE LEGACY HF CACHE LAYOUT
+#
+# Earlier versions of this bootstrap downloaded SkyReels/Qwen with
+# cache_dir="$HF_HOME" instead of "$HF_HUB_CACHE", placing them directly
+# under $HF_HOME instead of $HF_HOME/hub. That causes a second, wasteful
+# download at runtime since huggingface_hub reads/writes $HF_HUB_CACHE.
+#
+# If a completed legacy download is found and nothing already exists at
+# the canonical destination, move it into place so it is reused instead
+# of re-downloaded. This never deletes anything and never overwrites an
+# existing hub cache entry.
+# ============================================================
+
+log "CHECK FOR LEGACY HUGGING FACE CACHE LAYOUT"
+
+migrate_legacy_hf_cache_entry() {
+    local model_dirname="$1"
+    local legacy_path="$HF_HOME/$model_dirname"
+    local canonical_path="$HF_HUB_CACHE/$model_dirname"
+
+    if [[ ! -d "$legacy_path" ]]; then
+        return 0
+    fi
+
+    if [[ -e "$canonical_path" ]]; then
+        echo "Canonical cache entry already exists, leaving legacy copy untouched: $legacy_path"
+        return 0
+    fi
+
+    if [[ ! -d "$legacy_path/snapshots" ]]; then
+        echo "Legacy path does not look like a completed model cache, skipping: $legacy_path"
+        return 0
+    fi
+
+    echo "Migrating legacy cache entry into canonical hub cache: $model_dirname"
+    mv "$legacy_path" "$canonical_path"
+}
+
+migrate_legacy_hf_cache_entry "models--Skywork--SkyReels-V2-DF-14B-540P-Diffusers"
+migrate_legacy_hf_cache_entry "models--Qwen--Qwen2.5-VL-7B-Instruct"
 
 # ============================================================
 # DOWNLOAD MODELS
@@ -917,7 +962,7 @@ from huggingface_hub import snapshot_download
 snapshot_download(
     repo_id="Skywork/SkyReels-V2-DF-14B-540P-Diffusers",
     token=os.environ["HF_TOKEN"],
-    cache_dir="$HF_HOME",
+    cache_dir=os.environ["HF_HUB_CACHE"],
 )
 
 print("SKYREELS MODEL READY ✅")
@@ -927,11 +972,12 @@ log "DOWNLOAD QWEN REFERENCE ANALYZER"
 
 # This public model does not use the Hugging Face token required by LTX.
 "$TOOLPY" - <<PY
+import os
 from huggingface_hub import snapshot_download
 
 snapshot_download(
     repo_id="Qwen/Qwen2.5-VL-7B-Instruct",
-    cache_dir="$HF_HOME",
+    cache_dir=os.environ["HF_HUB_CACHE"],
     token=False,
 )
 
@@ -993,12 +1039,13 @@ test -f \
 "$WAN_I2V_QUANT/Wan2.2-I2V-A14B_NVFP4_Sparse_low.safetensors"
 
 "$TOOLPY" - <<PY
+import os
 from pathlib import Path
 from huggingface_hub import snapshot_download
 
 model_path = Path(snapshot_download(
     repo_id="Qwen/Qwen2.5-VL-7B-Instruct",
-    cache_dir="$HF_HOME",
+    cache_dir=os.environ["HF_HUB_CACHE"],
     token=False,
     local_files_only=True,
 ))
@@ -1176,6 +1223,7 @@ source .env
 set +a
 
 export HF_HOME=/opt/ai-movie/cache/huggingface
+export HF_HUB_CACHE=/opt/ai-movie/cache/huggingface/hub
 export CUDA_HOME=/usr/local/cuda-13.0
 export PATH="$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
